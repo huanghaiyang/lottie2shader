@@ -30,14 +30,19 @@ function render(frame) {
   const batches = words[0];
   const vertexCount = words[1];
   const uvCount = words[2];
-  const combined = (totalWords - 3 - batches * BATCH_WORDS - vertexCount * 2 - uvCount * 2) / 2;
+  // 尾部：pass 记录 + 蒙版记录
+  const tail = 3 + batches * BATCH_WORDS + vertexCount * 2 + uvCount * 2;
+  const passCount = words[tail] ?? 0;
+  const maskStart = tail + 1 + passCount * 10;
+  const maskCount = words[maskStart] ?? 0;
+  const residual = totalWords - (maskStart + 1 + maskCount * 6);
   const kinds = {};
   for (let i = 0; i < batches; i++) {
     const base = 3 + i * BATCH_WORDS;
     const kind = words[base];
     kinds[kind] = (kinds[kind] || 0) + 1;
   }
-  return { ok: true, batches, vertices: vertexCount, uvs: uvCount, residual: combined, kinds };
+  return { ok: true, batches, vertices: vertexCount, uvs: uvCount, passes: passCount, masks: maskCount, residual, kinds };
 }
 
 const dir = 'D:/sgames/lottie2shader/public/animations';

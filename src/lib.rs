@@ -15,19 +15,21 @@
 //! - 矩形 rc、椭圆 el、贝塞尔路径 sh、组 gr；
 //! - 纯色填充 fl、纯色描边 st、线性/径向渐变填充 gf、渐变描边 gs；
 //! - trim path（tm，支持按组合长度或按单条路径裁剪，支持动画）；
+//! - 合并路径（mm，仅 Merge 模式：把组内子路径合并后用组的填充规则整体三角化）；
 //! - 轨道遮罩（tt=1/2，alpha 与反相 alpha）；亮度遮罩不支持；
 //! - 3D 图层的 rx/ry/rz 旋转与透视投影（不含 3D 相机）；
 //! - 图层与组的变换、不透明度关键帧、父子关系、预合成嵌套。
 //!
 //! 明确不支持的特性会直接返回错误，由前端注册中心回退到 canvas，绝不静默画错：
 //! 文本图层（需要字体轮廓）、表达式（需要 JS 引擎）、图层蒙版、图层特效、
-//! 3D 相机、亮度轨道遮罩、星形/重复器/合并路径等形状修饰器。
+//! 3D 相机、亮度轨道遮罩、星形/重复器等形状修饰器，以及合并路径的布尔模式
+//! （mm=2/3/4/5，Add/Subtract/Intersect/Exclude）。
 
 use std::collections::{HashMap, HashSet};
 
 use lyon::algorithms::measure::{PathMeasurements, SampleType};
 use lyon::math::Point;
-use lyon::path::Path;
+use lyon::path::{Path, PathEvent};
 use lyon::tessellation::geometry_builder::{BuffersBuilder, VertexBuffers};
 use lyon::tessellation::{
   FillOptions, FillRule, FillTessellator, FillVertex, LineCap, LineJoin, StrokeOptions,
@@ -50,6 +52,12 @@ const KIND_SOLID: u32 = 1;
 const KIND_IMAGE: u32 = 2;
 const KIND_NULL: u32 = 3;
 const KIND_SHAPE: u32 = 4;
+/// 蒙版覆盖几何：只输出 alpha（与图层内容一起合成）
+const KIND_MASK: u32 = 5;
+/// 全屏覆盖几何：给反向蒙版的「加」模式铺底
+const KIND_FULL: u32 = 6;
+/// 无 passId 的批次（直接画到父目标）
+const PASS_NONE: u32 = u32::MAX;
 
 // ---------------------------------------------------------------------------
 // 投影矩阵（3×3 齐次，可表达 2D 仿射与 3D 透视投影）
@@ -206,7 +214,21 @@ impl Mat4 {
 // ---------------------------------------------------------------------------
 
 fn as_f32(v: Option<&Value>, def: f32) -> f32 {
-  v.and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(def)
+  // Lottie 里不少数值位会用布尔表示（en、inv、sz、mm 等），按 1/0 解析
+  match v {
+    Some(Value::Bool(flag)) => {
+      if *flag {
+        1.0
+      } else {
+        0.0
+      }
+    }
+    Some(other) => other
+      .as_f64()
+      .map(|x| x as f32)
+      .unwrap_or(def),
+    None => def,
+  }
 }
 
 fn is_animated(prop: Option<&Value>) -> bool {
@@ -483,8 +505,32 @@ struct Layer {
   group: u32,
   /// 0 普通、1 遮罩源、2 被遮罩
   role: u32,
-  /// 1 alpha、2 反相 alpha
+  /// 1 alpha、2 反相 alpha、3 亮度、4 反相亮度
   matte_mode: u32,
+  /// 图层高斯模糊（ef 29），可能为动画属性
+  blur: Option<BlurFx>,
+  /// 图层蒙版（masksProperties）
+  masks: Vec<MaskSpec>,
+}
+
+/// 图层高斯模糊参数（数值保持原始属性，渲染时再按帧求值）
+struct BlurFx {
+  blurriness: Value,
+  dimensions: Value,
+  edge: Value,
+}
+
+/// 一条图层蒙版
+#[derive(Clone)]
+struct MaskSpec {
+  /// 遮罩路径属性（pt）
+  path: Value,
+  /// 0 加 / 1 减 / 2 交 / 3 忽略
+  mode: u32,
+  /// 反向蒙版
+  inv: bool,
+  /// 不透明度（百分比属性）
+  opacity: Value,
 }
 
 struct ImageAsset {
@@ -550,6 +596,40 @@ fn bezier_path(
   }
   builder.end(closed);
   Some(builder.build())
+}
+
+/// mm=1（Merge）：把组内子路径合并成一条路径。
+/// Merge 不做布尔运算，只把各子轮廓归入同一条路径，由后续填充规则（nonzero/evenodd）
+/// 统一判定内部区域，因此空洞、重叠等由轮廓绕向自然表达。
+fn merge_paths(paths: &mut Vec<Path>) {
+  if paths.len() <= 1 {
+    return;
+  }
+  let mut builder = Path::builder();
+  for path in paths.iter() {
+    for event in path.iter() {
+      match event {
+        PathEvent::Begin { at } => {
+          builder.begin(at);
+        }
+        PathEvent::Line { to, .. } => {
+          builder.line_to(to);
+        }
+        PathEvent::Quadratic { ctrl, to, .. } => {
+          builder.quadratic_bezier_to(ctrl, to);
+        }
+        PathEvent::Cubic { ctrl1, ctrl2, to, .. } => {
+          builder.cubic_bezier_to(ctrl1, ctrl2, to);
+        }
+        PathEvent::End { close, .. } => {
+          builder.end(close);
+        }
+      }
+    }
+  }
+  let merged = builder.build();
+  paths.clear();
+  paths.push(merged);
 }
 
 fn arr2(v: Option<&Value>) -> Vec<[f32; 2]> {
@@ -768,8 +848,258 @@ fn path_from_rect(item: &Value, mat: &Mat, frame: f32) -> Option<Path> {
 }
 
 // ---------------------------------------------------------------------------
-// trim path
+// 多边形 / 星形（polystar）几何
 // ---------------------------------------------------------------------------
+
+fn path_from_star(item: &Value, mat: &Mat, frame: f32) -> Option<Path> {
+  let star = as_f32(item.get("sy"), 1.0) <= 1.5;
+  let points = prop_f32(item.get("pt"), frame, 5.0).floor().max(1.0) as usize;
+  let pos = prop_vec(item.get("p"), frame, 2, &[0.0, 0.0]);
+  let rot = prop_f32(item.get("r"), frame, 0.0).to_radians();
+  let dir = if as_f32(item.get("d"), 1.0) >= 3.0 { -1.0 } else { 1.0 };
+  let outer = prop_f32(item.get("or"), frame, 0.0);
+  let inner = prop_f32(item.get("ir"), frame, 0.0);
+  let os = prop_f32(item.get("os"), frame, 0.0) / 100.0;
+  let round_inner = prop_f32(item.get("is"), frame, 0.0) / 100.0;
+  let count = if star { points * 2 } else { points };
+  let angle = std::f32::consts::PI * 2.0 / count as f32;
+  let mut start = -std::f32::consts::PI * 0.5 + rot;
+  let mut verts: Vec<[f32; 2]> = Vec::with_capacity(count);
+  let mut ins: Vec<[f32; 2]> = Vec::with_capacity(count);
+  let mut outs: Vec<[f32; 2]> = Vec::with_capacity(count);
+  for i in 0..count {
+    let long = star && i % 2 == 0;
+    let rad = if long || !star { outer } else { inner };
+    let roundness = if long || !star { os } else { round_inner };
+    let perim = if long || !star {
+      2.0 * std::f32::consts::PI * outer / (count * 2) as f32
+    } else {
+      2.0 * std::f32::consts::PI * inner / (count * 2) as f32
+    };
+    let x = rad * start.cos();
+    let y = rad * start.sin();
+    let len = (x * x + y * y).sqrt();
+    let (ox, oy) = if len < 1.0e-6 {
+      (0.0, 0.0)
+    } else {
+      (y / len, -x / len)
+    };
+    verts.push([x + pos[0], y + pos[1]]);
+    ins.push([ox * perim * roundness * dir, oy * perim * roundness * dir]);
+    outs.push([-ox * perim * roundness * dir, -oy * perim * roundness * dir]);
+    start += angle * dir;
+  }
+  bezier_path(&verts, &ins, &outs, true, mat)
+}
+
+
+/// lottie 的圆角常量（四分之一圆的贝塞尔控制点比例）
+const ROUND_CORNER: f32 = 0.5519;
+
+/// 一个轮廓顶点及其入/出控制点（绝对坐标）
+struct CornerVertex {
+  p: [f32; 2],
+  i: [f32; 2],
+  o: [f32; 2],
+}
+
+#[inline]
+fn near_point(a: [f32; 2], b: [f32; 2]) -> bool {
+  (a[0] - b[0]).abs() < 0.01 && (a[1] - b[1]).abs() < 0.01
+}
+
+/// 把 lyon 路径拆成「顶点 + 入/出控制点」的轮廓集合，便于做圆角处理
+fn path_contours(path: &Path) -> Vec<(Vec<CornerVertex>, bool)> {
+  let mut out: Vec<(Vec<CornerVertex>, bool)> = Vec::new();
+  let mut current: Vec<CornerVertex> = Vec::new();
+  for event in path.iter() {
+    match event {
+      PathEvent::Begin { at } => {
+        current = vec![CornerVertex {
+          p: [at.x, at.y],
+          i: [at.x, at.y],
+          o: [at.x, at.y],
+        }];
+      }
+      PathEvent::Line { from, to } => {
+        if let Some(v) = current.last_mut() {
+          v.o = [from.x, from.y];
+        }
+        current.push(CornerVertex {
+          p: [to.x, to.y],
+          i: [to.x, to.y],
+          o: [to.x, to.y],
+        });
+      }
+      PathEvent::Quadratic { from, ctrl, to } => {
+        if let Some(v) = current.last_mut() {
+          v.o = [from.x + (ctrl.x - from.x) * 2.0 / 3.0, from.y + (ctrl.y - from.y) * 2.0 / 3.0];
+        }
+        current.push(CornerVertex {
+          p: [to.x, to.y],
+          i: [to.x + (ctrl.x - to.x) * 2.0 / 3.0, to.y + (ctrl.y - to.y) * 2.0 / 3.0],
+          o: [to.x, to.y],
+        });
+      }
+      PathEvent::Cubic {
+        ctrl1,
+        ctrl2,
+        to,
+        ..
+      } => {
+        if let Some(v) = current.last_mut() {
+          v.o = [ctrl1.x, ctrl1.y];
+        }
+        current.push(CornerVertex {
+          p: [to.x, to.y],
+          i: [ctrl2.x, ctrl2.y],
+          o: [to.x, to.y],
+        });
+      }
+      PathEvent::End { close, .. } => {
+        let closed = close;
+        if closed && current.len() > 1 {
+          let first = current[0].p;
+          let last = current.last().unwrap();
+          if near_point(first, last.p) {
+            // 闭合路径的末顶点与首顶点重合：把末顶点的入切向并入首顶点
+            current[0].i = last.i;
+            current.pop();
+          }
+        }
+        if current.len() >= 2 {
+          out.push((std::mem::take(&mut current), closed));
+        } else {
+          current.clear();
+        }
+      }
+    }
+  }
+  out
+}
+
+/// 圆角修饰器（rd）：对所有「无控制柄」的尖角做倒角。
+/// 与 lottie 一致：单边切掉长度取 min(半径, 相邻边长/2)，圆弧用 0.5519 常量近似。
+fn round_corners(path: &Path, radius: f32) -> Option<Path> {
+  if radius <= 0.01 {
+    return None;
+  }
+  let contours = path_contours(path);
+  let mut builder = Path::builder();
+  let mut changed = false;
+  for (contour, closed) in contours {
+    let n = contour.len();
+    if n < 2 {
+      continue;
+    }
+    let mut verts: Vec<[f32; 2]> = Vec::with_capacity(n * 2);
+    let mut ins: Vec<[f32; 2]> = Vec::with_capacity(n * 2);
+    let mut outs: Vec<[f32; 2]> = Vec::with_capacity(n * 2);
+    for idx in 0..n {
+      let v = &contour[idx];
+      // 开放路径的首末顶点没有完整的两条边，不能倒角
+      if (!closed && (idx == 0 || idx == n - 1)) || !near_point(v.i, v.p) || !near_point(v.o, v.p) {
+        verts.push(v.p);
+        ins.push([v.i[0] - v.p[0], v.i[1] - v.p[1]]);
+        outs.push([v.o[0] - v.p[0], v.o[1] - v.p[1]]);
+        continue;
+      }
+      let prev = &contour[(idx + n - 1) % n];
+      let next = &contour[(idx + 1) % n];
+      let d_prev = ((v.p[0] - prev.p[0]).powi(2) + (v.p[1] - prev.p[1]).powi(2)).sqrt();
+      let d_next = ((next.p[0] - v.p[0]).powi(2) + (next.p[1] - v.p[1]).powi(2)).sqrt();
+      let cut_prev = radius.min(d_prev / 2.0);
+      let cut_next = radius.min(d_next / 2.0);
+      if cut_prev < 0.01 || cut_next < 0.01 {
+        verts.push(v.p);
+        ins.push([0.0, 0.0]);
+        outs.push([0.0, 0.0]);
+        continue;
+      }
+      let p1 = [
+        v.p[0] + (prev.p[0] - v.p[0]) / d_prev * cut_prev,
+        v.p[1] + (prev.p[1] - v.p[1]) / d_prev * cut_prev,
+      ];
+      let p2 = [
+        v.p[0] + (next.p[0] - v.p[0]) / d_next * cut_next,
+        v.p[1] + (next.p[1] - v.p[1]) / d_next * cut_next,
+      ];
+      // p1 出切向与 p2 入切向都指向原尖角，形成圆弧
+      verts.push(p1);
+      ins.push([0.0, 0.0]);
+      outs.push([(v.p[0] - p1[0]) * ROUND_CORNER, (v.p[1] - p1[1]) * ROUND_CORNER]);
+      verts.push(p2);
+      ins.push([(v.p[0] - p2[0]) * ROUND_CORNER, (v.p[1] - p2[1]) * ROUND_CORNER]);
+      outs.push([0.0, 0.0]);
+      changed = true;
+    }
+    let m = verts.len();
+    if m < 2 {
+      continue;
+    }
+    if m == 2 {
+      builder.begin(to_point(&Mat::identity(), verts[0]));
+      builder.line_to(to_point(&Mat::identity(), verts[1]));
+      builder.end(closed);
+      continue;
+    }
+    builder.begin(to_point(&Mat::identity(), verts[0]));
+    let segments = if closed { m } else { m - 1 };
+    for i in 0..segments {
+      let j = (i + 1) % m;
+      let c1 = [verts[i][0] + outs[i][0], verts[i][1] + outs[i][1]];
+      let c2 = [verts[j][0] + ins[j][0], verts[j][1] + ins[j][1]];
+      let straight = (c1[0] - verts[i][0]).abs() < 0.01
+        && (c1[1] - verts[i][1]).abs() < 0.01
+        && (c2[0] - verts[j][0]).abs() < 0.01
+        && (c2[1] - verts[j][1]).abs() < 0.01;
+      if straight {
+        builder.line_to(to_point(&Mat::identity(), verts[j]));
+      } else {
+        builder.cubic_bezier_to(
+          to_point(&Mat::identity(), c1),
+          to_point(&Mat::identity(), c2),
+          to_point(&Mat::identity(), verts[j]),
+        );
+      }
+    }
+    builder.end(closed);
+  }
+  changed.then(|| builder.build())
+}
+
+/// 重复器（rp）第 t 个副本的变换：平移 p*t、绕锚点旋转 -r*t、按 s^t 缩放
+fn repeater_matrix(item: &Value, frame: f32, t: f32) -> Mat {
+  let tr = item.get("tr");
+  let p = prop_vec(tr.and_then(|t| t.get("p")), frame, 2, &[0.0, 0.0]);
+  let a = prop_vec(tr.and_then(|t| t.get("a")), frame, 2, &[0.0, 0.0]);
+  let s = prop_vec(tr.and_then(|t| t.get("s")), frame, 2, &[100.0, 100.0]);
+  let r = prop_f32(tr.and_then(|t| t.get("r")), frame, 0.0).to_radians();
+  let sx = s[0] / 100.0;
+  let sy = s[1] / 100.0;
+  let whole = t.floor();
+  let frac = t - whole;
+  // lottie 逐副本累乘缩放；小数偏移用线性插值补齐
+  let fx = sx.powf(whole) * (sx + (1.0 - sx) * (1.0 - frac));
+  let fy = sy.powf(whole) * (sy + (1.0 - sy) * (1.0 - frac));
+  let anchor = Mat::translate(a[0], a[1]);
+  let back = Mat::translate(-a[0], -a[1]);
+  let rot = anchor.mul(&Mat::rotate(-r * t)).mul(&back);
+  let scale = anchor.mul(&Mat::scale(fx, fy)).mul(&back);
+  let offset = Mat::translate(p[0] * t, p[1] * t);
+  rot.mul(&scale).mul(&offset)
+}
+
+/// 重复器每个副本的不透明度：so → eo 线性过渡
+fn repeater_opacity(item: &Value, frame: f32, index: f32, copies: f32) -> f32 {
+  let tr = item.get("tr");
+  let so = prop_f32(tr.and_then(|t| t.get("so")), frame, 100.0) / 100.0;
+  let eo = prop_f32(tr.and_then(|t| t.get("eo")), frame, 100.0) / 100.0;
+  if copies <= 1.0 {
+    return so;
+  }
+  so + (eo - so) * (index / (copies - 1.0))
+}
 
 fn path_length(path: &Path) -> f32 {
   let measurements = PathMeasurements::from_path(path, TOLERANCE);
@@ -1062,9 +1392,44 @@ fn walk_items(
   // 组内已收集的路径，供后续填充 / 描边画笔使用；trim 会就地改写它们
   let mut paths: Vec<Path> = Vec::new();
 
-  for item in items {
+  for (index, item) in items.iter().enumerate() {
     let ty = item.get("ty").and_then(|t| t.as_str()).unwrap_or("");
     match ty {
+      "rp" => {
+        // 重复器：复制它前面的全部形状与样式，每个副本套一层变换与不透明度
+        let copies_f = prop_f32(item.get("c"), frame, 1.0).max(0.0).ceil();
+        let copies = copies_f as usize;
+        if index > 0 && copies > 0 {
+          let prefix: Vec<Value> = items[..index].to_vec();
+          let offset = prop_f32(item.get("o"), frame, 0.0);
+          let reversed = as_f32(item.get("m"), 1.0) >= 2.0;
+          // 原先按副本 1 处理的内容要整体丢弃，改为按副本重放
+          paints.clear();
+          geoms.clear();
+          paths.clear();
+          for step in 0..copies {
+            let copy = if reversed { copies - 1 - step } else { step } as f32;
+            let copy_mat = mat.mul(&repeater_matrix(item, frame, copy + offset));
+            let copy_alpha = group_alpha * repeater_opacity(item, frame, copy, copies_f);
+            let (child_paints, mut child_geoms) = walk_items(&prefix, copy_mat, copy_alpha, frame);
+            let paint_offset = paints.len();
+            for geom in &mut child_geoms {
+              if geom.image.is_none() {
+                geom.paint += paint_offset;
+              }
+            }
+            paints.extend(child_paints);
+            geoms.extend(child_geoms);
+          }
+        }
+      }
+      "rd" => {
+        let radius = prop_f32(item.get("r"), frame, 0.0).max(0.0) * mat.scale_factor();
+        paths = std::mem::take(&mut paths)
+          .into_iter()
+          .map(|p| round_corners(&p, radius).unwrap_or(p))
+          .collect();
+      }
       "gr" => {
         if let Some(child) = item.get("it").and_then(|i| i.as_array()) {
           let (child_paints, mut child_geoms) = walk_items(child, mat, group_alpha, frame);
@@ -1094,6 +1459,11 @@ fn walk_items(
           paths.push(p);
         }
       }
+      "sr" => {
+        if let Some(p) = path_from_star(item, &mat, frame) {
+          paths.push(p);
+        }
+      }
       "tm" => {
         let s = prop_f32(item.get("s"), frame, 0.0) / 100.0;
         let e = prop_f32(item.get("e"), frame, 100.0) / 100.0;
@@ -1101,6 +1471,10 @@ fn walk_items(
         // m=1 同时（组合长度），m=2 单独（每条路径各裁一段）
         let individually = as_f32(item.get("m"), 1.0) >= 2.0;
         paths = apply_trim(&paths, s, e, o, individually);
+      }
+      "mm" => {
+        // 合并模式在 check_shapes 已校验，这里只处理 mm=1（Merge）
+        merge_paths(&mut paths);
       }
       "fl" => {
         let paint = solid_paint(item, group_alpha, frame);
@@ -1187,7 +1561,22 @@ fn check_shapes(items: &[Value]) -> Result<(), String> {
           check_shapes(children)?;
         }
       }
-      "sh" | "el" | "rc" | "fl" | "st" | "gf" | "gs" | "tr" | "tm" | "no" => {}
+      "mm" => {
+        // 仅实现 Merge（mm=1）；Add/Subtract/Intersect/Exclude 需要布尔运算
+        if as_f32(item.get("mm"), 1.0) >= 1.5 {
+          return Err("不支持的合并路径模式（仅支持 Merge，请回退 canvas 渲染）".to_string());
+        }
+      }
+      "rd" => {
+        // 圆角修饰器：半径可为 0、可动画；渲染时按帧在路径上倒角
+      }
+      "rp" => {
+        // 重复器：按副本数复制前方的形状与样式
+        if prop_f32(item.get("c"), 0.0, 1.0) > 1000.0 {
+          return Err("重复器副本数过多".to_string());
+        }
+      }
+      "sh" | "el" | "rc" | "sr" | "fl" | "st" | "gf" | "gs" | "tr" | "tm" | "no" => {}
       other => {
         return Err(format!("不支持的形状类型：{other}（请回退 canvas 渲染）"));
       }
@@ -1204,6 +1593,60 @@ fn find_asset<'a>(doc: &'a Value, id: &str) -> Option<&'a Value> {
         .iter()
         .find(|x| x.get("id").and_then(|i| i.as_str()) == Some(id))
     })
+}
+
+/// 图层特效里处于启用状态的项（缺省视为启用，en=0 视为关闭）
+fn enabled_effects(layer: &Value) -> Vec<&Value> {
+  layer
+    .get("ef")
+    .and_then(|e| e.as_array())
+    .map(|arr| arr.iter().filter(|ef| as_f32(ef.get("en"), 1.0) > 0.5).collect())
+    .unwrap_or_default()
+}
+
+/// 解析高斯模糊（ef ty=29）：lottie 的 effectElements 顺序是
+/// [Blurriness, Blur Dimensions, Edge Mode]，直接按位置取值。
+fn layer_blur(layer: &Value) -> Option<BlurFx> {
+  let effects = enabled_effects(layer);
+  let effect = effects.iter().find(|ef| as_f32(ef.get("ty"), 0.0) == 29.0)?;
+  let params = effect.get("ef")?.as_array()?;
+  // 参数缺省时按 lottie 默认值补齐，避免「有模糊效果却未生效」的静默错误
+  let value = |i: usize, def: f32| -> Value {
+    params
+      .get(i)
+      .and_then(|p| p.get("v"))
+      .cloned()
+      .unwrap_or(Value::from(def))
+  };
+  Some(BlurFx {
+    blurriness: value(0, 0.0),
+    dimensions: value(1, 1.0),
+    edge: value(2, 0.0),
+  })
+}
+
+/// 解析图层蒙版；mode 映射为 0 加 / 1 减 / 2 交 / 3 忽略
+fn layer_masks(layer: &Value) -> Vec<MaskSpec> {
+  let Some(masks) = layer.get("masksProperties").and_then(|m| m.as_array()) else {
+    return Vec::new();
+  };
+  masks
+    .iter()
+    .filter_map(|mask| {
+      let mode = match mask.get("mode").and_then(|m| m.as_str()).unwrap_or("a") {
+        "s" => 1,
+        "i" => 2,
+        "n" => 3,
+        _ => 0,
+      };
+      Some(MaskSpec {
+        path: mask.get("pt")?.clone(),
+        mode,
+        inv: as_f32(mask.get("inv"), 0.0) > 0.5,
+        opacity: mask.get("o").cloned().unwrap_or(Value::Null),
+      })
+    })
+    .collect()
 }
 
 fn check_layers(
@@ -1240,18 +1683,36 @@ fn check_layers(
       other => return Err(format!("不支持的图层类型 ty={other}")),
     }
     if let Some(masks) = layer.get("masksProperties").and_then(|m| m.as_array()) {
-      if !masks.is_empty() {
-        return Err("图层蒙版（masksProperties）暂不支持".to_string());
+      for mask in masks {
+        let mode = mask.get("mode").and_then(|m| m.as_str()).unwrap_or("a");
+        if !matches!(mode, "a" | "s" | "i" | "n") {
+          return Err(format!("不支持的图层蒙版模式：{mode}（请回退 canvas 渲染）"));
+        }
+        // lottie 用 feMorphology 实现蒙版扩张/收缩，GPU 侧没有等价实现
+        if prop_f32(mask.get("x"), 0.0, 0.0).abs() > 1.0e-6 {
+          return Err("图层蒙版的扩张/收缩（x）暂不支持（请回退 canvas 渲染）".to_string());
+        }
+        if mask.get("pt").is_none() {
+          return Err("图层蒙版缺少路径属性 pt".to_string());
+        }
       }
     }
-    if let Some(effects) = layer.get("ef").and_then(|e| e.as_array()) {
-      if !effects.is_empty() {
-        return Err("图层特效（ef）暂不支持".to_string());
+    let effects = enabled_effects(layer);
+    if !effects.is_empty() {
+      if effects.len() > 1 {
+        return Err("多个图层特效叠加暂不支持（请回退 canvas 渲染）".to_string());
       }
-    }
-    let tt = layer.get("tt").and_then(|t| t.as_f64()).unwrap_or(0.0) as i64;
-    if tt == 3 || tt == 4 {
-      return Err("亮度轨道遮罩暂不支持".to_string());
+      let ty_effect = as_f32(effects[0].get("ty"), 0.0) as i64;
+      if ty_effect != 29 {
+        return Err(format!("不支持的图层特效 ty={ty_effect}（仅支持高斯模糊）"));
+      }
+      let params = effects[0]
+        .get("ef")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| "高斯模糊缺少参数".to_string())?;
+      if params.len() < 2 || params.first().and_then(|p| p.get("v")).is_none() {
+        return Err("高斯模糊参数不完整".to_string());
+      }
     }
     if ty == 4 {
       if let Some(shapes) = layer.get("shapes").and_then(|s| s.as_array()) {
@@ -1358,6 +1819,8 @@ fn placeholder(
     group: 0,
     role: 0,
     matte_mode: 0,
+    blur: None,
+    masks: Vec::new(),
   }
 }
 
@@ -1403,6 +1866,8 @@ fn compile_scope(
     entries.push(slot);
 
     let mut entry = placeholder(container, time_offset, ip, op, ks, ddd, pe);
+    entry.blur = layer_blur(layer);
+    entry.masks = layer_masks(layer);
     match ty {
       4 => {
         let shapes = layer
@@ -1509,7 +1974,7 @@ fn compile_scope(
     if tt == 0 {
       continue;
     }
-    if tt != 1 && tt != 2 {
+    if tt != 1 && tt != 2 && tt != 3 && tt != 4 {
       continue;
     }
     let Some(mask_slot) = entry_of_raw[idx] else {
@@ -1601,6 +2066,35 @@ struct Batch {
   matte: u32,
   role: u32,
   image: Option<usize>,
+  /// 所属图层 pass（模糊 / 蒙版图层及其预合成子图层共享同一 id）
+  pass_id: u32,
+}
+
+/// 一个需要离屏合成的图层 pass（模糊或蒙版）
+struct PassRec {
+  id: u32,
+  sigma_x: f32,
+  sigma_y: f32,
+  wrap: bool,
+  mask_first: usize,
+  mask_count: usize,
+  first_batch: usize,
+  batch_end: usize,
+  /// 外层 pass（预合成子图层继承的 pass），用于扩展批次区间
+  parent: u32,
+}
+
+/// 一条图层蒙版的渲染指令
+struct MaskRec {
+  /// 0 加 / 1 减 / 2 交
+  op: u32,
+  inv: bool,
+  /// 蒙版覆盖几何所在批次
+  batch: usize,
+  pass: u32,
+  opacity: f32,
+  /// 反向「加」蒙版需要先铺满全屏的批次
+  quad: Option<usize>,
 }
 
 struct Renderer<'a> {
@@ -1615,6 +2109,9 @@ struct Renderer<'a> {
   batches: Vec<Batch>,
   vertices: Vec<[f32; 2]>,
   uvs: Vec<[f32; 2]>,
+  passes: Vec<PassRec>,
+  pass_index: HashMap<u32, usize>,
+  masks: Vec<MaskRec>,
 }
 
 impl<'a> Renderer<'a> {
@@ -1632,6 +2129,186 @@ impl<'a> Renderer<'a> {
       batches: Vec::new(),
       vertices: Vec::new(),
       uvs: Vec::new(),
+      passes: Vec::new(),
+      pass_index: HashMap::new(),
+      masks: Vec::new(),
+    }
+  }
+
+  /// 预合成 / 蒙版图层是否需要独立离屏 pass
+  fn layer_pass(&self, i: usize) -> Option<u32> {
+    let layer = &self.c.layers[i];
+    if layer.blur.is_some() || !layer.masks.is_empty() {
+      Some(i as u32)
+    } else {
+      None
+    }
+  }
+
+  /// 登记一个 pass（首次出现时按当前帧的模糊参数算出画布像素 sigma）
+  fn ensure_pass(&mut self, id: u32, parent: u32) {
+    if self.pass_index.contains_key(&id) {
+      return;
+    }
+    let local = self.frame - self.c.layers[id as usize].time_offset;
+    let (blurriness, dimensions, edge) = match &self.c.layers[id as usize].blur {
+      Some(b) => (
+        prop_f32(Some(&b.blurriness), local, 0.0),
+        prop_f32(Some(&b.dimensions), local, 1.0) as i32,
+        prop_f32(Some(&b.edge), local, 0.0) as i32,
+      ),
+      None => (0.0, 1i32, 0),
+    };
+    let world = self.world_of(id as usize);
+    let sx = self.c.width / self.c.doc_w;
+    let sy = self.c.height / self.c.doc_h;
+    // lottie：sigma = 0.3 * Blurriness（图层局部坐标），再乘以世界缩放与画布缩放
+    let k = 0.3 * blurriness * world.scale_factor();
+    let sigma_x = if dimensions == 3 { 0.0 } else { k * sx };
+    let sigma_y = if dimensions == 2 { 0.0 } else { k * sy };
+    let index = self.passes.len();
+    self.passes.push(PassRec {
+      id,
+      sigma_x,
+      sigma_y,
+      wrap: edge == 1,
+      mask_first: usize::MAX,
+      mask_count: 0,
+      // 区间由 add_batch 按实际批次回填：pass 刚创建时可能还没有任何批次
+      first_batch: usize::MAX,
+      batch_end: usize::MAX,
+      parent,
+    });
+    self.pass_index.insert(id, index);
+  }
+
+  /// 推入一个批次，并把区间扩展到其所有祖先 pass
+  fn add_batch(&mut self, batch: Batch) {
+    let index = self.batches.len();
+    let mut p = batch.pass_id;
+    while p != PASS_NONE {
+      let Some(&pi) = self.pass_index.get(&p) else {
+        break;
+      };
+      let rec = &mut self.passes[pi];
+      if rec.first_batch == usize::MAX {
+        rec.first_batch = index;
+      }
+      rec.batch_end = index + 1;
+      p = rec.parent;
+    }
+    self.batches.push(batch);
+  }
+
+  /// 把图层蒙版烘焙成覆盖几何，并登记蒙版记录
+  fn emit_masks(&mut self, i: usize, pass: u32, group: u32, role: u32, matte: u32) {
+    let (masks, offset) = {
+      let layer = &self.c.layers[i];
+      (layer.masks.clone(), layer.time_offset)
+    };
+    if masks.is_empty() {
+      return;
+    }
+    let world = self.world_of(i);
+    let c = self.c;
+    let cmat = Mat::scale(c.width / c.doc_w, c.height / c.doc_h).mul(&world);
+    let local = self.frame - offset;
+    let mut first = usize::MAX;
+    let mut count = 0usize;
+    for mask in &masks {
+      if mask.mode == 3 {
+        continue;
+      }
+      let Some(data) = path_data_at(&mask.path, local) else {
+        continue;
+      };
+      let opacity = prop_f32(Some(&mask.opacity), local, 100.0) / 100.0;
+      if opacity <= 0.001 {
+        continue;
+      }
+      let Some(path) = bezier_path(&data.verts, &data.ins, &data.outs, data.closed, &cmat) else {
+        continue;
+      };
+      let mut geoms: Vec<Geom> = Vec::new();
+      tessellate_fill(&[path], FillRule::NonZero, 0, &mut geoms);
+      let mut batch_index = None;
+      for geom in &geoms {
+        if geom.verts.is_empty() {
+          continue;
+        }
+        let vert_first = self.vertices.len();
+        self.vertices.extend_from_slice(&geom.verts);
+        batch_index.get_or_insert(self.batches.len());
+        self.add_batch(Batch {
+          kind: KIND_MASK,
+          first: vert_first,
+          count: geom.verts.len(),
+          color: [1.0, 1.0, 1.0, 1.0],
+          alpha: opacity,
+          p0: [0.0, 0.0],
+          p1: [0.0, 0.0],
+          stops: Vec::new(),
+          uv_first: 0,
+          group,
+          matte,
+          role,
+          image: None,
+          pass_id: pass,
+        });
+      }
+      let Some(batch) = batch_index else {
+        continue;
+      };
+      // 反向 + 加：先用全屏覆盖铺底，再用该路径做减法才能得到补集
+      let quad = if mask.inv && mask.mode == 0 {
+        let vert_first = self.vertices.len();
+        self.vertices.extend_from_slice(&[
+          [0.0, 0.0],
+          [c.width, 0.0],
+          [c.width, c.height],
+          [0.0, 0.0],
+          [c.width, c.height],
+          [0.0, c.height],
+        ]);
+        let index = self.batches.len();
+        self.add_batch(Batch {
+          kind: KIND_FULL,
+          first: vert_first,
+          count: 6,
+          color: [1.0, 1.0, 1.0, 1.0],
+          alpha: 1.0,
+          p0: [0.0, 0.0],
+          p1: [0.0, 0.0],
+          stops: Vec::new(),
+          uv_first: 0,
+          group,
+          matte,
+          role,
+          image: None,
+          pass_id: pass,
+        });
+        Some(index)
+      } else {
+        None
+      };
+      if first == usize::MAX {
+        first = self.masks.len();
+      }
+      count += 1;
+      self.masks.push(MaskRec {
+        op: mask.mode,
+        inv: mask.inv,
+        batch,
+        pass,
+        opacity,
+        quad,
+      });
+    }
+    if count > 0 {
+      if let Some(&pi) = self.pass_index.get(&pass) {
+        self.passes[pi].mask_first = first;
+        self.passes[pi].mask_count = count;
+      }
     }
   }
 
@@ -1694,14 +2371,14 @@ impl<'a> Renderer<'a> {
     alpha
   }
 
-  fn render_list(&mut self, list: &[usize], group: u32, role: u32, matte: u32) {
+  fn render_list(&mut self, list: &[usize], group: u32, role: u32, matte: u32, pass: u32) {
     // 继承分组（预合成子图层）：整段按同一遮罩角色绘制
     if group != 0 {
       for &i in list.iter().rev() {
         if !self.active(i) {
           continue;
         }
-        self.render_entry(i, group, role, matte);
+        self.render_entry(i, group, role, matte, pass);
       }
       return;
     }
@@ -1721,19 +2398,19 @@ impl<'a> Renderer<'a> {
           for &j in list.iter().rev() {
             let source = &self.c.layers[j];
             if source.role == 1 && source.group == layer.group {
-              self.render_entry(j, layer.group, 1, 0);
+              self.render_entry(j, layer.group, 1, 0, pass);
             }
           }
         }
         let matte_mode = layer.matte_mode;
-        self.render_entry(i, layer.group, 2, matte_mode);
+        self.render_entry(i, layer.group, 2, matte_mode, pass);
       } else {
-        self.render_entry(i, 0, 0, 0);
+        self.render_entry(i, 0, 0, 0, pass);
       }
     }
   }
 
-  fn render_entry(&mut self, i: usize, group: u32, role: u32, matte: u32) {
+  fn render_entry(&mut self, i: usize, group: u32, role: u32, matte: u32, pass: u32) {
     if !self.active(i) {
       return;
     }
@@ -1743,18 +2420,34 @@ impl<'a> Renderer<'a> {
       return;
     }
     let kind = self.c.layers[i].kind;
+    // 图层自身需要模糊 / 蒙版时开一个新的 pass，否则继承父 pass
+    let my_pass = self.layer_pass(i).unwrap_or(pass);
+    if my_pass != PASS_NONE {
+      self.ensure_pass(my_pass, pass);
+    }
     if kind == KIND_PRECOMP {
       let children = self.c.layers[i].children.clone();
-      self.render_list(&children, group, role, matte);
+      self.render_list(&children, group, role, matte, my_pass);
+      self.emit_masks(i, my_pass, group, role, matte);
       return;
     }
     if kind == KIND_NULL {
       return;
     }
-    self.emit(i, world, alpha, group, role, matte);
+    self.emit(i, world, alpha, group, role, matte, my_pass);
+    self.emit_masks(i, my_pass, group, role, matte);
   }
 
-  fn emit(&mut self, i: usize, world: Mat, layer_alpha: f32, group: u32, role: u32, matte: u32) {
+  fn emit(
+    &mut self,
+    i: usize,
+    world: Mat,
+    layer_alpha: f32,
+    group: u32,
+    role: u32,
+    matte: u32,
+    pass: u32,
+  ) {
     let c = self.c;
     let layer = &c.layers[i];
     let sx = c.width / c.doc_w;
@@ -1790,7 +2483,7 @@ impl<'a> Renderer<'a> {
       if let Some(image) = geom.image {
         let uv_first = self.uvs.len();
         self.uvs.extend_from_slice(&geom.uvs);
-        self.batches.push(Batch {
+        self.add_batch(Batch {
           kind: 3,
           first,
           count: geom.verts.len(),
@@ -1804,6 +2497,7 @@ impl<'a> Renderer<'a> {
           matte,
           role,
           image: Some(image),
+          pass_id: pass,
         });
         continue;
       }
@@ -1812,7 +2506,7 @@ impl<'a> Renderer<'a> {
       };
       let g0 = world.apply(paint.p0);
       let g1 = world.apply(paint.p1);
-      self.batches.push(Batch {
+      self.add_batch(Batch {
         kind: paint.kind,
         first,
         count: geom.verts.len(),
@@ -1826,6 +2520,7 @@ impl<'a> Renderer<'a> {
         matte,
         role,
         image: None,
+        pass_id: pass,
       });
     }
   }
@@ -1834,7 +2529,7 @@ impl<'a> Renderer<'a> {
 fn render_frame(c: &Compiled, frame: f32) -> Vec<u8> {
   let mut r = Renderer::new(c, frame);
   let roots = c.roots.clone();
-  r.render_list(&roots, 0, 0, 0);
+  r.render_list(&roots, 0, 0, 0, PASS_NONE);
 
   let mut words: Vec<u32> = Vec::with_capacity(
     3 + r.batches.len() * BATCH_WORDS + r.vertices.len() * 2 + r.uvs.len() * 2,
@@ -1874,8 +2569,9 @@ fn render_frame(c: &Compiled, frame: f32) -> Vec<u8> {
     words.push(b.matte);
     words.push(b.role);
     words.push(b.image.map(|i| i as u32).unwrap_or(u32::MAX));
-    // 58..63 保留
-    for _ in 58..BATCH_WORDS {
+    words.push(b.pass_id);
+    // 59..63 保留
+    for _ in 59..BATCH_WORDS {
       words.push(0);
     }
   }
@@ -1886,6 +2582,39 @@ fn render_frame(c: &Compiled, frame: f32) -> Vec<u8> {
   for uv in &r.uvs {
     words.push(uv[0].to_bits());
     words.push(uv[1].to_bits());
+  }
+
+  // 尾部：图层 pass（模糊）与蒙版记录，供 JS 做离屏合成
+  let active_passes: Vec<&PassRec> = r
+    .passes
+    .iter()
+    .filter(|p| p.first_batch != usize::MAX && p.batch_end > p.first_batch)
+    .collect();
+  words.push(active_passes.len() as u32);
+  for p in &active_passes {
+    words.push(p.id);
+    words.push(p.first_batch as u32);
+    words.push((p.batch_end - p.first_batch) as u32);
+    words.push(if p.wrap { 1 } else { 0 });
+    words.push(p.sigma_x.to_bits());
+    words.push(p.sigma_y.to_bits());
+    words.push(0);
+    words.push(if p.mask_count > 0 {
+      p.mask_first as u32
+    } else {
+      u32::MAX
+    });
+    words.push(p.mask_count as u32);
+    words.push(0);
+  }
+  words.push(r.masks.len() as u32);
+  for m in &r.masks {
+    words.push(m.op);
+    words.push(if m.inv { 1 } else { 0 });
+    words.push(m.batch as u32);
+    words.push(m.pass);
+    words.push(m.opacity.to_bits());
+    words.push(m.quad.map(|q| q as u32).unwrap_or(u32::MAX));
   }
 
   let mut bytes: Vec<u8> = Vec::with_capacity(words.len() * 4);
@@ -2178,6 +2907,57 @@ mod tests {
   }
 
   #[test]
+  fn merge_paths_keeps_hole_via_fill_rule() {
+    // 外框顺时针、内框逆时针：mm=1 合并成一条路径后按 nonzero 填充，
+    // 面积应为「外框 - 内框」；若不合并而逐条三角化，内框会被单独填满。
+    let shapes = serde_json::json!([{
+      "ty": "gr",
+      "it": [
+        {"ty": "sh", "ks": {"a": 0, "k": {
+          "c": true,
+          "v": [[-100, -60], [100, -60], [100, 60], [-100, 60]],
+          "i": [[0, 0], [0, 0], [0, 0], [0, 0]],
+          "o": [[0, 0], [0, 0], [0, 0], [0, 0]]
+        }}},
+        {"ty": "sh", "ks": {"a": 0, "k": {
+          "c": true,
+          "v": [[-30, -20], [-30, 20], [30, 20], [30, -20]],
+          "i": [[0, 0], [0, 0], [0, 0], [0, 0]],
+          "o": [[0, 0], [0, 0], [0, 0], [0, 0]]
+        }}},
+        {"ty": "mm", "mm": 1},
+        {"ty": "fl", "r": 1, "c": {"a": 0, "k": [1, 0, 0, 1]}, "o": {"a": 0, "k": 100}},
+        {"ty": "tr", "p": {"a": 0, "k": [0, 0]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "r": {"a": 0, "k": 0}, "o": {"a": 0, "k": 100}}
+      ]
+    }]);
+    let doc = serde_json::json!({
+      "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+      "layers": [base_layer(shapes)]
+    });
+    let compiled = compile_doc(&doc, 400.0, 400.0).expect("compile");
+    let bytes = render_frame(&compiled, 0.0);
+    let words = read_words(&bytes);
+    let batch_count = words[0] as usize;
+    let base = vertex_base(&words);
+    let mut area = 0.0f32;
+    for b in 0..batch_count {
+      let header = 3 + b * BATCH_WORDS;
+      let vertex_start = words[header + 1] as usize;
+      let vertex_count = words[header + 2] as usize;
+      for tri in (0..vertex_count).step_by(3) {
+        let a = read_vertex(&words, base, vertex_start + tri);
+        let p1 = read_vertex(&words, base, vertex_start + tri + 1);
+        let p2 = read_vertex(&words, base, vertex_start + tri + 2);
+        area += ((p1[0] - a[0]) * (p2[1] - a[1]) - (p2[0] - a[0]) * (p1[1] - a[1])).abs() * 0.5;
+      }
+    }
+    // 外框 200x120 = 24000，内框 60x40 = 2400
+    let expected = 24000.0 - 2400.0;
+    let ratio = area / expected;
+    assert!(ratio > 0.98 && ratio < 1.02, "合并后面积 {area}，面积比 {ratio}");
+  }
+
+  #[test]
   fn precomp_layers_are_expanded_with_transform() {
     let doc = serde_json::json!({
       "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
@@ -2369,5 +3149,187 @@ mod tests {
       Ok(_) => panic!("文本图层应当编译失败"),
     };
     assert!(err.contains("文本图层"), "实际错误：{err}");
+  }
+
+  /// 尾部（pass + mask 记录）的起始字下标
+  fn tail_start(words: &[u32]) -> usize {
+    3 + words[0] as usize * BATCH_WORDS + words[1] as usize * 2 + words[2] as usize * 2
+  }
+
+  /// 三角化后所有批次的总面积（像素）
+  fn total_area(words: &[u32]) -> f32 {
+    let batch_count = words[0] as usize;
+    let base = vertex_base(words);
+    let mut area = 0.0f32;
+    for b in 0..batch_count {
+      let header = 3 + b * BATCH_WORDS;
+      let vertex_start = words[header + 1] as usize;
+      let vertex_count = words[header + 2] as usize;
+      for tri in (0..vertex_count).step_by(3) {
+        let a = read_vertex(words, base, vertex_start + tri);
+        let p1 = read_vertex(words, base, vertex_start + tri + 1);
+        let p2 = read_vertex(words, base, vertex_start + tri + 2);
+        area += (((p1[0] - a[0]) * (p2[1] - a[1]) - (p2[0] - a[0]) * (p1[1] - a[1])).abs()) * 0.5;
+      }
+    }
+    area
+  }
+
+  #[test]
+  fn gaussian_blur_emits_layer_pass() {
+    let mut layer = base_layer(serde_json::json!([rect_group(
+      serde_json::json!({"ty": "fl", "c": {"a": 0, "k": [1, 0, 0, 1]}, "o": {"a": 0, "k": 100}})
+    )]));
+    // lottie 的 Gaussian Blur（ef ty=29）：Blurriness 20、Dimensions 1、Edge 0
+    layer["ef"] = serde_json::json!([{
+      "ty": 29, "en": 1, "nm": "Gaussian Blur",
+      "ef": [
+        {"v": {"a": 0, "k": 20}},
+        {"v": {"a": 0, "k": 1}},
+        {"v": {"a": 0, "k": 0}}
+      ]
+    }]);
+    let doc = serde_json::json!({
+      "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+      "layers": [layer]
+    });
+    let compiled = compile_doc(&doc, 400.0, 400.0).expect("compile");
+    let words = read_words(&render_frame(&compiled, 0.0));
+    let tail = tail_start(&words);
+    assert_eq!(words[tail], 1, "模糊图层应登记一个离屏 pass");
+    let p = tail + 1;
+    // sigma = 0.3 × Blurriness × 世界缩放 × 画布缩放（这里都为 1）
+    let sigma_x = f32::from_bits(words[p + 4]);
+    let sigma_y = f32::from_bits(words[p + 5]);
+    assert!((sigma_x - 6.0).abs() < 0.01, "sigmaX={sigma_x}");
+    assert!((sigma_y - 6.0).abs() < 0.01, "sigmaY={sigma_y}");
+    assert_eq!(words[p + 3], 0, "Edge Mode 0 应为 clamp");
+    assert_eq!(words[p + 8], 0, "该图层没有蒙版");
+    // 内容批次应归属该 pass，JS 才会走离屏渲染
+    let batch_pass = words[3 + 58] as usize;
+    assert_eq!(batch_pass, words[p] as usize, "批次应带上 passId");
+  }
+
+  #[test]
+  fn layer_mask_emits_coverage_and_inverse_quad() {
+    let make = |inv: bool| {
+      let mut layer = base_layer(serde_json::json!([rect_group(
+        serde_json::json!({"ty": "fl", "c": {"a": 0, "k": [0, 1, 0, 1]}, "o": {"a": 0, "k": 100}})
+      )]));
+      layer["masksProperties"] = serde_json::json!([{
+        "mode": "a", "inv": inv, "nm": "m",
+        "pt": {"a": 0, "k": {
+          "c": true,
+          "v": [[-50, -40], [50, -40], [50, 40], [-50, 40]],
+          "i": [[0, 0], [0, 0], [0, 0], [0, 0]],
+          "o": [[0, 0], [0, 0], [0, 0], [0, 0]]
+        }},
+        "o": {"a": 0, "k": 100}
+      }]);
+      serde_json::json!({
+        "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+        "layers": [layer]
+      })
+    };
+    let plain = read_words(&render_frame(&compile_doc(&make(false), 400.0, 400.0).unwrap(), 0.0));
+    let tail = tail_start(&plain);
+    assert_eq!(plain[tail], 1, "蒙版图层应登记一个离屏 pass");
+    let mask_start = tail + 1 + plain[tail] as usize * 10;
+    assert_eq!(plain[mask_start], 1, "应登记一条蒙版记录");
+    let m = mask_start + 1;
+    assert_eq!(plain[m], 0, "mode a → 加");
+    assert_eq!(plain[m + 1], 0, "非反向");
+    assert_eq!(plain[m + 5], u32::MAX, "非反向「加」不需要铺底 quad");
+    // 蒙版覆盖几何是 kind=5 批次
+    let mut has_coverage = false;
+    for b in 0..plain[0] as usize {
+      if plain[3 + b * BATCH_WORDS] == KIND_MASK {
+        has_coverage = true;
+      }
+    }
+    assert!(has_coverage, "缺少蒙版覆盖几何（kind=5）");
+
+    // 反向「加」必须额外铺一层全屏覆盖（kind=6），否则补集算不出来
+    let inverted = read_words(&render_frame(&compile_doc(&make(true), 400.0, 400.0).unwrap(), 0.0));
+    let tail = tail_start(&inverted);
+    let mask_start = tail + 1 + inverted[tail] as usize * 10;
+    let m = mask_start + 1;
+    assert_eq!(inverted[m + 1], 1, "应为反向蒙版");
+    assert_ne!(inverted[m + 5], u32::MAX, "反向「加」应带全屏 quad 批次");
+    let quad = inverted[m + 5] as usize;
+    assert_eq!(inverted[3 + quad * BATCH_WORDS], KIND_FULL, "quad 应为 kind=6");
+  }
+
+  #[test]
+  fn round_corner_star_and_repeater_shapes_render() {
+    // rd：200×120 矩形四角各切半径 20 → 面积减少 (4-π)·r²
+    let rounded = {
+      let items = serde_json::json!([
+        {"ty": "rc", "p": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [200, 120]}, "r": {"a": 0, "k": 0}},
+        {"ty": "rd", "r": {"a": 0, "k": 20}, "nm": "rd"},
+        {"ty": "fl", "c": {"a": 0, "k": [1, 0, 0, 1]}, "o": {"a": 0, "k": 100}},
+        {"ty": "tr", "p": {"a": 0, "k": [0, 0]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "r": {"a": 0, "k": 0}, "o": {"a": 0, "k": 100}}
+      ]);
+      serde_json::json!({
+        "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+        "layers": [base_layer(serde_json::json!([{"ty": "gr", "it": items, "nm": "g"}]))]
+      })
+    };
+    let words = read_words(&render_frame(&compile_doc(&rounded, 400.0, 400.0).unwrap(), 0.0));
+    let expected = 200.0 * 120.0 - (4.0 - std::f32::consts::PI) * 20.0 * 20.0;
+    let ratio = total_area(&words) / expected;
+    assert!(ratio > 0.97 && ratio < 1.03, "圆角后面积比 {ratio}");
+
+    // sr：5 角星（外径 100、内径 50）面积 = 5·R·r·sin(π/5)
+    let star = serde_json::json!({
+      "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+      "layers": [base_layer(serde_json::json!([{
+        "ty": "gr",
+        "it": [
+          {"ty": "sr", "sy": 1, "d": 1, "pt": {"a": 0, "k": 5}, "p": {"a": 0, "k": [0, 0]},
+           "r": {"a": 0, "k": 0}, "ir": {"a": 0, "k": 50}, "is": {"a": 0, "k": 0},
+           "or": {"a": 0, "k": 100}, "os": {"a": 0, "k": 0}},
+          {"ty": "fl", "c": {"a": 0, "k": [0, 0, 1, 1]}, "o": {"a": 0, "k": 100}},
+          {"ty": "tr", "p": {"a": 0, "k": [0, 0]}, "a": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [100, 100]}, "r": {"a": 0, "k": 0}, "o": {"a": 0, "k": 100}}
+        ]
+      }]))]
+    });
+    let words = read_words(&render_frame(&compile_doc(&star, 400.0, 400.0).unwrap(), 0.0));
+    let expected = 5.0 * 100.0 * 50.0 * (std::f32::consts::PI / 5.0).sin();
+    let ratio = total_area(&words) / expected;
+    assert!(ratio > 0.95 && ratio < 1.05, "星形面积比 {ratio}");
+
+    // rp：3 个副本 → 顶点数约为单个副本的 3 倍
+    let make = |repeat: bool| {
+      let mut items = vec![
+        serde_json::json!({"ty": "rc", "p": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [40, 40]}, "r": {"a": 0, "k": 0}}),
+        serde_json::json!({"ty": "fl", "c": {"a": 0, "k": [0, 0, 0, 1]}, "o": {"a": 0, "k": 100}}),
+      ];
+      if repeat {
+        items.push(serde_json::json!({
+          "ty": "rp", "c": {"a": 0, "k": 3}, "o": {"a": 0, "k": 0}, "m": 1, "nm": "rp",
+          "tr": {
+            "p": {"a": 0, "k": [50, 0]}, "a": {"a": 0, "k": [0, 0]},
+            "s": {"a": 0, "k": [100, 100]}, "r": {"a": 0, "k": 0},
+            "so": {"a": 0, "k": 100}, "eo": {"a": 0, "k": 100}
+          }
+        }));
+      }
+      serde_json::json!({
+        "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+        "layers": [base_layer(serde_json::json!([{"ty": "gr", "it": items, "nm": "g"}]))]
+      })
+    };
+    let single = read_words(&render_frame(&compile_doc(&make(false), 400.0, 400.0).unwrap(), 0.0));
+    let triple = read_words(&render_frame(&compile_doc(&make(true), 400.0, 400.0).unwrap(), 0.0));
+    let ratio = triple[1] as f32 / single[1] as f32;
+    assert!((ratio - 3.0).abs() < 0.05, "重复器顶点数比 {ratio}");
+    // 副本沿 x 平移：最右端应明显大于单副本
+    let base = vertex_base(&triple);
+    let mut max_x = f32::MIN;
+    for i in 0..triple[1] as usize {
+      max_x = max_x.max(read_vertex(&triple, base, i)[0]);
+    }
+    assert!(max_x > 240.0, "重复器平移未生效：max_x={max_x}");
   }
 }
