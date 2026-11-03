@@ -268,20 +268,22 @@ fn bezier_y(t: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
   3.0 * inv * inv * u * y1 + 3.0 * inv * u * u * y2 + u * u * u
 }
 
-/// 从 `{x:[..], y:[..]}` 中读取缓动控制点；部分导出把百分比写成 0~100，这里统一归一化
+/// 从缓动控制点里读取一个分量：变换类关键帧写成标量 `{"x":0.358,"y":0.965}`，
+/// 形状 / 蒙版类关键帧写成数组 `{"x":[...],"y":[...]}`，两种都要支持。
 fn easing_pair(v: Option<&Value>) -> (f32, f32) {
-  let x = v
-    .and_then(|e| e.get("x"))
-    .and_then(|x| x.as_array())
-    .and_then(|x| x.first())
-    .and_then(|x| x.as_f64())
-    .unwrap_or(0.0) as f32;
-  let y = v
-    .and_then(|e| e.get("y"))
-    .and_then(|y| y.as_array())
-    .and_then(|y| y.first())
-    .and_then(|y| y.as_f64())
-    .unwrap_or(0.0) as f32;
+  fn component(e: Option<&Value>, key: &str) -> f32 {
+    match e.and_then(|e| e.get(key)) {
+      Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0) as f32,
+      Some(Value::Array(arr)) => arr
+        .first()
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0) as f32,
+      _ => 0.0,
+    }
+  }
+  let x = component(v, "x");
+  let y = component(v, "y");
+  // 部分导出把控制点写成百分比（0~100），统一归一化
   let norm = if x > 1.0 || y > 1.0 { 100.0 } else { 1.0 };
   (x / norm, y / norm)
 }
@@ -507,6 +509,10 @@ struct Layer {
   role: u32,
   /// 1 alpha、2 反相 alpha、3 亮度、4 反相亮度
   matte_mode: u32,
+  /// 被遮罩图层对应的遮罩源图层下标（role == 2 时有效）
+  matte_src: Option<usize>,
+  /// 图层混合模式（lottie 的 bm 原值，0 表示正常混合）
+  blend: u32,
   /// 图层高斯模糊（ef 29），可能为动画属性
   blur: Option<BlurFx>,
   /// 图层蒙版（masksProperties）
@@ -834,8 +840,8 @@ fn path_from_rect(item: &Value, mat: &Mat, frame: f32) -> Option<Path> {
     [0.0, 0.0],
     [0.0, -k],
   ];
+  // 每个顶点的入切线：顶点 i 的入切线对应上一段（圆弧）结束处的控制柄
   let ins = [
-    [0.0, 0.0],
     [-k, 0.0],
     [0.0, 0.0],
     [0.0, -k],
@@ -843,6 +849,7 @@ fn path_from_rect(item: &Value, mat: &Mat, frame: f32) -> Option<Path> {
     [k, 0.0],
     [0.0, 0.0],
     [0.0, k],
+    [0.0, 0.0],
   ];
   bezier_path(&verts, &ins, &outs, true, mat)
 }
@@ -1333,15 +1340,19 @@ fn gradient_paint(item: &Value, alpha: f32, frame: f32) -> Paint {
     // 色标可能是 4 分量（rgb）或 5 分量（rgba），按总长度判断
     if !values.is_empty() {
       let stride = if count > 0 && values.len() == count * 5 { 5 } else { 4 };
-      let mut i = 0;
-      while i + stride <= values.len() && stops.len() < MAX_STOPS {
+      // 导出器有时会在 k 里追加第二组渐变（长度翻倍），必须按 p 截断
+      let total = if count > 0 { count } else { values.len() / stride };
+      for s in 0..total.min(MAX_STOPS) {
+        let i = s * stride;
+        if i + stride > values.len() {
+          break;
+        }
         let offset = values[i];
         let r = values[i + 1];
         let g = values[i + 2];
         let b = values[i + 3];
         let a = if stride == 5 { values[i + 4] } else { 1.0 };
         stops.push([offset, r, g, b, a]);
-        i += stride;
       }
     }
   }
@@ -1378,7 +1389,7 @@ fn walk_items(
   base: Mat,
   alpha: f32,
   frame: f32,
-) -> (Vec<Paint>, Vec<Geom>) {
+) -> (Vec<Paint>, Vec<Geom>, Vec<Path>) {
   let mut paints: Vec<Paint> = Vec::new();
   let mut geoms: Vec<Geom> = Vec::new();
   // 组内 `tr` 决定本组变换与不透明度
@@ -1411,7 +1422,7 @@ fn walk_items(
             let copy = if reversed { copies - 1 - step } else { step } as f32;
             let copy_mat = mat.mul(&repeater_matrix(item, frame, copy + offset));
             let copy_alpha = group_alpha * repeater_opacity(item, frame, copy, copies_f);
-            let (child_paints, mut child_geoms) = walk_items(&prefix, copy_mat, copy_alpha, frame);
+            let (child_paints, mut child_geoms, _) = walk_items(&prefix, copy_mat, copy_alpha, frame);
             let paint_offset = paints.len();
             for geom in &mut child_geoms {
               if geom.image.is_none() {
@@ -1432,16 +1443,22 @@ fn walk_items(
       }
       "gr" => {
         if let Some(child) = item.get("it").and_then(|i| i.as_array()) {
-          let (child_paints, mut child_geoms) = walk_items(child, mat, group_alpha, frame);
-          // 子组的画笔下标是局部编号，合并到父组后需要整体平移
-          let offset = paints.len();
-          for geom in &mut child_geoms {
-            if geom.image.is_none() {
-              geom.paint += offset;
+          let (child_paints, mut child_geoms, child_paths) = walk_items(child, mat, group_alpha, frame);
+          if child_geoms.is_empty() {
+            // 子组没有任何画笔时，其路径并入本组，由本组的填充 / 描边统一绘制
+            // （AE 导出常见：路径分组 + 组级 Gradient Fill）
+            paths.extend(child_paths);
+          } else {
+            // 子组的画笔下标是局部编号，合并到父组后需要整体平移
+            let offset = paints.len();
+            for geom in &mut child_geoms {
+              if geom.image.is_none() {
+                geom.paint += offset;
+              }
             }
+            paints.extend(child_paints);
+            geoms.extend(child_geoms);
           }
-          paints.extend(child_paints);
-          geoms.extend(child_geoms);
         }
       }
       "sh" => {
@@ -1535,7 +1552,7 @@ fn walk_items(
       _ => {}
     }
   }
-  (paints, geoms)
+  (paints, geoms, paths)
 }
 
 // ---------------------------------------------------------------------------
@@ -1819,6 +1836,8 @@ fn placeholder(
     group: 0,
     role: 0,
     matte_mode: 0,
+    matte_src: None,
+    blend: 0,
     blur: None,
     masks: Vec::new(),
   }
@@ -1859,6 +1878,9 @@ fn compile_scope(
     let op = as_f32(layer.get("op"), f32::MAX);
     let ddd = layer.get("ddd").and_then(|d| d.as_f64()).unwrap_or(0.0) > 0.0;
     let pe = as_f32(layer.get("pe"), 0.0);
+    let blend = layer.get("bm").and_then(|b| b.as_f64()).unwrap_or(0.0) as u32;
+    // 预合成图层的内容时间轴从 st 起算；普通图层的属性关键帧按当前帧直接求值
+    let st = as_f32(layer.get("st"), 0.0);
 
     let slot = out.len();
     out.push(placeholder(container, time_offset, ip, op, ks.clone(), ddd, pe));
@@ -1866,6 +1888,7 @@ fn compile_scope(
     entries.push(slot);
 
     let mut entry = placeholder(container, time_offset, ip, op, ks, ddd, pe);
+    entry.blend = blend;
     entry.blur = layer_blur(layer);
     entry.masks = layer_masks(layer);
     match ty {
@@ -1876,7 +1899,7 @@ fn compile_scope(
           .cloned()
           .unwrap_or_default();
         let dynamic = shapes.iter().any(has_animation);
-        let (paints, geoms) = walk_items(&shapes, Mat::identity(), 1.0, ip);
+        let (paints, geoms, _) = walk_items(&shapes, Mat::identity(), 1.0, ip);
         entry.geoms = geoms;
         entry.paints = paints;
         entry.dynamic = dynamic;
@@ -1930,7 +1953,7 @@ fn compile_scope(
           .get("layers")
           .and_then(|l| l.as_array())
           .ok_or_else(|| format!("预合成没有图层：{ref_id}"))?;
-        let st = as_f32(layer.get("st"), 0.0);
+        // 预合成的内容时间轴从本层的 st 起算
         let children = compile_scope(
           ctx,
           sub,
@@ -1968,34 +1991,53 @@ fn compile_scope(
     }
   }
 
-  // 轨道遮罩：tt 图层使用紧邻其上的 td 图层作为遮罩源
-  for idx in 1..raw.len() {
+  // 轨道遮罩配对：
+  // - `tp` 显式给出遮罩源的图层 ind（同一 scope 内查找）；
+  // - 否则沿用 lottie 的隐式规则：遮罩源是 ind - 1（图层列表中紧邻其上的那层）。
+  // 注意配对依据是 ind 而不是数组下标，且源图层不必带 td（td 只标记“这是遮罩源”）。
+  // 同一个遮罩源可以被多个被遮罩图层复用，因此不能把分组 id 写回源图层。
+  let ind_of = |value: &Value| value.get("ind").and_then(|v| v.as_f64());
+  let slot_by_ind = |ind: f64| -> Option<usize> {
+    raw.iter()
+      .position(|layer| ind_of(layer) == Some(ind))
+      .and_then(|raw_index| entry_of_raw[raw_index])
+  };
+  for idx in 0..raw.len() {
     let tt = raw[idx].get("tt").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
-    if tt == 0 {
-      continue;
-    }
-    if tt != 1 && tt != 2 && tt != 3 && tt != 4 {
+    if tt == 0 || !(1..=4).contains(&tt) {
       continue;
     }
     let Some(mask_slot) = entry_of_raw[idx] else {
       continue;
     };
-    let Some(src_slot) = entry_of_raw[idx - 1] else {
-      continue;
-    };
-    let td = raw[idx - 1].get("td").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    if td <= 0.0 {
+    if out[mask_slot].group != 0 {
       continue;
     }
-    if out[src_slot].group != 0 || out[mask_slot].group != 0 {
+    let src_slot = match raw[idx].get("tp").and_then(|v| v.as_f64()) {
+      Some(tp) => match slot_by_ind(tp) {
+        Some(slot) => slot,
+        None => continue,
+      },
+      None => {
+        let ind = ind_of(&raw[idx]);
+        match ind.and_then(|value| slot_by_ind(value - 1.0)) {
+          Some(slot) => slot,
+          None => match idx.checked_sub(1).and_then(|prev| entry_of_raw[prev]) {
+            Some(slot) => slot,
+            None => continue,
+          },
+        }
+      }
+    };
+    if src_slot == mask_slot {
       continue;
     }
     let gid = ctx.next_group();
-    out[src_slot].group = gid;
     out[src_slot].role = 1;
     out[mask_slot].group = gid;
     out[mask_slot].role = 2;
     out[mask_slot].matte_mode = tt as u32;
+    out[mask_slot].matte_src = Some(src_slot);
   }
 
   Ok(entries)
@@ -2068,6 +2110,10 @@ struct Batch {
   image: Option<usize>,
   /// 所属图层 pass（模糊 / 蒙版图层及其预合成子图层共享同一 id）
   pass_id: u32,
+  /// 所属图层的混合模式（0 正常）
+  blend: u32,
+  /// 所属图层在编译结果中的下标，前端据此把同一图层的批次归为一组
+  layer: u32,
 }
 
 /// 一个需要离屏合成的图层 pass（模糊或蒙版）
@@ -2254,6 +2300,8 @@ impl<'a> Renderer<'a> {
           role,
           image: None,
           pass_id: pass,
+          blend: 0,
+          layer: i as u32,
         });
       }
       let Some(batch) = batch_index else {
@@ -2286,6 +2334,8 @@ impl<'a> Renderer<'a> {
           role,
           image: None,
           pass_id: pass,
+          blend: 0,
+          layer: i as u32,
         });
         Some(index)
       } else {
@@ -2393,17 +2443,17 @@ impl<'a> Renderer<'a> {
         continue;
       }
       if layer.role == 2 && layer.group != 0 {
-        if !self.emitted.contains(&layer.group) {
-          self.emitted.insert(layer.group);
-          for &j in list.iter().rev() {
-            let source = &self.c.layers[j];
-            if source.role == 1 && source.group == layer.group {
-              self.render_entry(j, layer.group, 1, 0, pass);
-            }
+        let group_id = layer.group;
+        let matte_mode = layer.matte_mode;
+        let matte_src = layer.matte_src;
+        if !self.emitted.contains(&group_id) {
+          self.emitted.insert(group_id);
+          // 同一个遮罩源可被多个被遮罩图层复用，按分组逐个绘制
+          if let Some(j) = matte_src {
+            self.render_entry(j, group_id, 1, 0, pass);
           }
         }
-        let matte_mode = layer.matte_mode;
-        self.render_entry(i, layer.group, 2, matte_mode, pass);
+        self.render_entry(i, group_id, 2, matte_mode, pass);
       } else {
         self.render_entry(i, 0, 0, 0, pass);
       }
@@ -2463,7 +2513,7 @@ impl<'a> Renderer<'a> {
         .cloned()
         .unwrap_or_default();
       let local = self.frame - layer.time_offset;
-      let (p, g) = walk_items(&shapes, Mat::identity(), 1.0, local);
+      let (p, g, _) = walk_items(&shapes, Mat::identity(), 1.0, local);
       dyn_paints = p;
       dyn_geoms = g;
       (dyn_geoms.as_slice(), dyn_paints.as_slice())
@@ -2498,6 +2548,8 @@ impl<'a> Renderer<'a> {
           role,
           image: Some(image),
           pass_id: pass,
+          blend: layer.blend,
+          layer: i as u32,
         });
         continue;
       }
@@ -2521,6 +2573,8 @@ impl<'a> Renderer<'a> {
         role,
         image: None,
         pass_id: pass,
+        blend: layer.blend,
+        layer: i as u32,
       });
     }
   }
@@ -2570,8 +2624,10 @@ fn render_frame(c: &Compiled, frame: f32) -> Vec<u8> {
     words.push(b.role);
     words.push(b.image.map(|i| i as u32).unwrap_or(u32::MAX));
     words.push(b.pass_id);
-    // 59..63 保留
-    for _ in 59..BATCH_WORDS {
+    words.push(b.blend);
+    words.push(b.layer);
+    // 61..63 保留
+    for _ in 61..BATCH_WORDS {
       words.push(0);
     }
   }
