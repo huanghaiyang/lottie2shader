@@ -1,0 +1,19 @@
+[package]
+name = "lottie2shader"
+version = "0.1.0"
+edition = "2021"
+description = "把 Lottie 形状动画转换为 GPU 三角面片渲染计划"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json = "1"
+lyon = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
