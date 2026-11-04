@@ -38,9 +38,9 @@ use lyon::tessellation::{
 use serde_json::Value;
 
 /// 单个批次最多承载的渐变色标数量，与前端着色器 uniform 数组长度保持一致
-const MAX_STOPS: usize = 8;
-/// 批次头固定占用字（u32）数，必须与前端 BATCH_WORDS 一致
-const BATCH_WORDS: usize = 64;
+const MAX_STOPS: usize = 16;
+/// 批次头固定占用字（u32）数 = 13 + MAX_STOPS*5 + 9，必须与前端 BATCH_WORDS 一致
+const BATCH_WORDS: usize = 13 + MAX_STOPS * 5 + 11;
 /// 贝塞尔离散化的世界坐标容差（远小于 1 像素，保证矢量边缘足够平滑）
 const TOLERANCE: f32 = 0.15;
 /// 预合成最大嵌套深度，超过即为资源循环或异常文件
@@ -1327,12 +1327,37 @@ fn solid_paint(item: &Value, alpha: f32, frame: f32) -> Paint {
   }
 }
 
+/// 按位置 t 从色标序列中取色（用于超出着色器上限时的重采样）
+fn sample_gradient(stops: &[[f32; 5]], t: f32) -> [f32; 5] {
+  if stops.is_empty() {
+    return [0.0, 0.0, 0.0, 0.0, 1.0];
+  }
+  if t <= stops[0][0] {
+    return stops[0];
+  }
+  for i in 1..stops.len() {
+    if t < stops[i][0] {
+      let span = (stops[i][0] - stops[i - 1][0]).max(1e-5);
+      let f = ((t - stops[i - 1][0]) / span).clamp(0.0, 1.0);
+      let mut out = stops[i - 1];
+      for c in 1..5 {
+        out[c] = stops[i - 1][c] + (stops[i][c] - stops[i - 1][c]) * f;
+      }
+      out[0] = t;
+      return out;
+    }
+  }
+  let mut last = *stops.last().unwrap();
+  last[0] = t;
+  last
+}
+
 /// 渐变画笔（gf 填充 / gs 描边共用）
 fn gradient_paint(item: &Value, alpha: f32, frame: f32) -> Paint {
   let s = prop_vec(item.get("s"), frame, 2, &[0.0, 0.0]);
   let e = prop_vec(item.get("e"), frame, 2, &[1.0, 0.0]);
-  // Lottie：t=1 线性，t=2 径向；部分导出用 r=1 表示径向
-  let is_radial = as_f32(item.get("t"), 0.0) == 2.0 || as_f32(item.get("r"), 0.0) >= 1.0;
+  // Lottie：t=1 线性，t=2 径向。`r` 在 gf 上是填充规则（1 = nonzero），不是径向标志
+  let is_radial = as_f32(item.get("t"), 0.0) == 2.0;
   let mut stops: Vec<[f32; 5]> = Vec::new();
   if let Some(g) = item.get("g") {
     let count = as_f32(g.get("p"), 0.0) as usize;
@@ -1342,7 +1367,8 @@ fn gradient_paint(item: &Value, alpha: f32, frame: f32) -> Paint {
       let stride = if count > 0 && values.len() == count * 5 { 5 } else { 4 };
       // 导出器有时会在 k 里追加第二组渐变（长度翻倍），必须按 p 截断
       let total = if count > 0 { count } else { values.len() / stride };
-      for s in 0..total.min(MAX_STOPS) {
+      let mut all: Vec<[f32; 5]> = Vec::new();
+      for s in 0..total {
         let i = s * stride;
         if i + stride > values.len() {
           break;
@@ -1352,7 +1378,16 @@ fn gradient_paint(item: &Value, alpha: f32, frame: f32) -> Paint {
         let g = values[i + 2];
         let b = values[i + 3];
         let a = if stride == 5 { values[i + 4] } else { 1.0 };
-        stops.push([offset, r, g, b, a]);
+        all.push([offset, r, g, b, a]);
+      }
+      if all.len() > MAX_STOPS {
+        // 着色器只接受 MAX_STOPS 个色标，按位置均匀重采样，避免直接截断丢掉尾部颜色
+        for k in 0..MAX_STOPS {
+          let t = k as f32 / (MAX_STOPS - 1) as f32;
+          stops.push(sample_gradient(&all, t));
+        }
+      } else {
+        stops = all;
       }
     }
   }
@@ -2104,7 +2139,10 @@ struct Batch {
   p1: [f32; 2],
   stops: Vec<[f32; 5]>,
   uv_first: usize,
+  /// 轨道遮罩分组 id，0 表示普通批次
   group: u32,
+  /// 外层轨道遮罩分组 id（嵌套遮罩），0 表示没有外层分组
+  parent: u32,
   matte: u32,
   role: u32,
   image: Option<usize>,
@@ -2128,6 +2166,8 @@ struct PassRec {
   batch_end: usize,
   /// 外层 pass（预合成子图层继承的 pass），用于扩展批次区间
   parent: u32,
+  /// 该 pass 所属图层的轨道遮罩分组（0 表示不属于分组）
+  group: u32,
 }
 
 /// 一条图层蒙版的渲染指令
@@ -2192,7 +2232,7 @@ impl<'a> Renderer<'a> {
   }
 
   /// 登记一个 pass（首次出现时按当前帧的模糊参数算出画布像素 sigma）
-  fn ensure_pass(&mut self, id: u32, parent: u32) {
+  fn ensure_pass(&mut self, id: u32, parent: u32, group: u32) {
     if self.pass_index.contains_key(&id) {
       return;
     }
@@ -2224,6 +2264,7 @@ impl<'a> Renderer<'a> {
       first_batch: usize::MAX,
       batch_end: usize::MAX,
       parent,
+      group,
     });
     self.pass_index.insert(id, index);
   }
@@ -2247,7 +2288,7 @@ impl<'a> Renderer<'a> {
   }
 
   /// 把图层蒙版烘焙成覆盖几何，并登记蒙版记录
-  fn emit_masks(&mut self, i: usize, pass: u32, group: u32, role: u32, matte: u32) {
+  fn emit_masks(&mut self, i: usize, pass: u32, group: u32, role: u32, matte: u32, parent: u32) {
     let (masks, offset) = {
       let layer = &self.c.layers[i];
       (layer.masks.clone(), layer.time_offset)
@@ -2296,6 +2337,7 @@ impl<'a> Renderer<'a> {
           stops: Vec::new(),
           uv_first: 0,
           group,
+          parent,
           matte,
           role,
           image: None,
@@ -2330,6 +2372,7 @@ impl<'a> Renderer<'a> {
           stops: Vec::new(),
           uv_first: 0,
           group,
+          parent,
           matte,
           role,
           image: None,
@@ -2421,14 +2464,41 @@ impl<'a> Renderer<'a> {
     alpha
   }
 
-  fn render_list(&mut self, list: &[usize], group: u32, role: u32, matte: u32, pass: u32) {
-    // 继承分组（预合成子图层）：整段按同一遮罩角色绘制
+  fn render_list(
+    &mut self,
+    list: &[usize],
+    group: u32,
+    role: u32,
+    matte: u32,
+    pass: u32,
+    parent: u32,
+  ) {
+    // 继承分组（预合成子图层）：整段按同一遮罩角色绘制；
+    // 但子图层自身还可能构成另一组轨道遮罩（嵌套），需要按内层分组单独发射。
     if group != 0 {
       for &i in list.iter().rev() {
+        let layer = &self.c.layers[i];
+        if layer.role == 1 {
+          // 内层遮罩源在对应的被遮罩图层处统一绘制，保证批次连续
+          continue;
+        }
         if !self.active(i) {
           continue;
         }
-        self.render_entry(i, group, role, matte, pass);
+        if layer.role == 2 && layer.group != 0 {
+          let group_id = layer.group;
+          let matte_mode = layer.matte_mode;
+          let matte_src = layer.matte_src;
+          if !self.emitted.contains(&group_id) {
+            self.emitted.insert(group_id);
+            if let Some(j) = matte_src {
+              self.render_entry(j, group_id, 1, 0, pass, group);
+            }
+          }
+          self.render_entry(i, group_id, 2, matte_mode, pass, group);
+        } else {
+          self.render_entry(i, group, role, matte, pass, parent);
+        }
       }
       return;
     }
@@ -2450,17 +2520,25 @@ impl<'a> Renderer<'a> {
           self.emitted.insert(group_id);
           // 同一个遮罩源可被多个被遮罩图层复用，按分组逐个绘制
           if let Some(j) = matte_src {
-            self.render_entry(j, group_id, 1, 0, pass);
+            self.render_entry(j, group_id, 1, 0, pass, 0);
           }
         }
-        self.render_entry(i, group_id, 2, matte_mode, pass);
+        self.render_entry(i, group_id, 2, matte_mode, pass, 0);
       } else {
-        self.render_entry(i, 0, 0, 0, pass);
+        self.render_entry(i, 0, 0, 0, pass, 0);
       }
     }
   }
 
-  fn render_entry(&mut self, i: usize, group: u32, role: u32, matte: u32, pass: u32) {
+  fn render_entry(
+    &mut self,
+    i: usize,
+    group: u32,
+    role: u32,
+    matte: u32,
+    pass: u32,
+    parent: u32,
+  ) {
     if !self.active(i) {
       return;
     }
@@ -2473,19 +2551,19 @@ impl<'a> Renderer<'a> {
     // 图层自身需要模糊 / 蒙版时开一个新的 pass，否则继承父 pass
     let my_pass = self.layer_pass(i).unwrap_or(pass);
     if my_pass != PASS_NONE {
-      self.ensure_pass(my_pass, pass);
+      self.ensure_pass(my_pass, pass, group);
     }
     if kind == KIND_PRECOMP {
       let children = self.c.layers[i].children.clone();
-      self.render_list(&children, group, role, matte, my_pass);
-      self.emit_masks(i, my_pass, group, role, matte);
+      self.render_list(&children, group, role, matte, my_pass, parent);
+      self.emit_masks(i, my_pass, group, role, matte, parent);
       return;
     }
     if kind == KIND_NULL {
       return;
     }
-    self.emit(i, world, alpha, group, role, matte, my_pass);
-    self.emit_masks(i, my_pass, group, role, matte);
+    self.emit(i, world, alpha, group, role, matte, my_pass, parent);
+    self.emit_masks(i, my_pass, group, role, matte, parent);
   }
 
   fn emit(
@@ -2497,6 +2575,7 @@ impl<'a> Renderer<'a> {
     role: u32,
     matte: u32,
     pass: u32,
+    parent: u32,
   ) {
     let c = self.c;
     let layer = &c.layers[i];
@@ -2544,6 +2623,7 @@ impl<'a> Renderer<'a> {
           stops: Vec::new(),
           uv_first,
           group,
+          parent,
           matte,
           role,
           image: Some(image),
@@ -2569,6 +2649,7 @@ impl<'a> Renderer<'a> {
         stops: paint.stops.clone(),
         uv_first: 0,
         group,
+        parent,
         matte,
         role,
         image: None,
@@ -2583,7 +2664,7 @@ impl<'a> Renderer<'a> {
 fn render_frame(c: &Compiled, frame: f32) -> Vec<u8> {
   let mut r = Renderer::new(c, frame);
   let roots = c.roots.clone();
-  r.render_list(&roots, 0, 0, 0, PASS_NONE);
+  r.render_list(&roots, 0, 0, 0, PASS_NONE, 0);
 
   let mut words: Vec<u32> = Vec::with_capacity(
     3 + r.batches.len() * BATCH_WORDS + r.vertices.len() * 2 + r.uvs.len() * 2,
@@ -2626,8 +2707,10 @@ fn render_frame(c: &Compiled, frame: f32) -> Vec<u8> {
     words.push(b.pass_id);
     words.push(b.blend);
     words.push(b.layer);
-    // 61..63 保留
-    for _ in 61..BATCH_WORDS {
+    // 其后是 word 61：外层轨道遮罩分组（嵌套遮罩），剩余字保留
+    words.push(b.parent);
+    let used = 13 + MAX_STOPS * 5 + 9;
+    for _ in used..BATCH_WORDS {
       words.push(0);
     }
   }
@@ -2654,7 +2737,8 @@ fn render_frame(c: &Compiled, frame: f32) -> Vec<u8> {
     words.push(if p.wrap { 1 } else { 0 });
     words.push(p.sigma_x.to_bits());
     words.push(p.sigma_y.to_bits());
-    words.push(0);
+    // word 6：该 pass 所在图层的轨道遮罩分组（0 表示不在分组内）
+    words.push(p.group);
     words.push(if p.mask_count > 0 {
       p.mask_first as u32
     } else {
