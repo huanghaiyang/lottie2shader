@@ -283,8 +283,9 @@ fn easing_pair(v: Option<&Value>) -> (f32, f32) {
   }
   let x = component(v, "x");
   let y = component(v, "y");
-  // 部分导出把控制点写成百分比（0~100），统一归一化
-  let norm = if x > 1.0 || y > 1.0 { 100.0 } else { 1.0 };
+  // 部分导出把控制点写成百分比（0~100）时归一化；
+  // 但 1~2 之间的回弹控制点（overshoot）是合法值，lottie-web 原样使用，不能压缩
+  let norm = if x > 10.0 || y > 10.0 { 100.0 } else { 1.0 };
   (x / norm, y / norm)
 }
 
@@ -334,15 +335,18 @@ fn prop_vec(prop: Option<&Value>, frame: f32, dim: usize, def: &[f32]) -> Vec<f3
         return value_vec(a.get("s"), dim, def);
       }
       let raw = if tb > ta { (time - ta) / (tb - ta) } else { 0.0 };
+      // lottie-web（PropertyFactory）用当前关键帧自身的 o / i 作为该段的两个控制点，
+      // 取下一关键帧的 i 会得到明显不同的缓动曲线。
       let (x1, y1) = easing_pair(a.get("o"));
-      let (x2, y2) = easing_pair(b.get("i"));
+      let (x2, y2) = easing_pair(a.get("i"));
       let eased = if x1 == 0.0 && y1 == 0.0 && x2 == 1.0 && y2 == 1.0 {
         raw
       } else {
         bezier_y(raw, x1, y1, x2, y2)
       };
       let start = value_vec(a.get("s"), dim, def);
-      let end = value_vec(a.get("e").or_else(|| b.get("s")), dim, &start);
+      // 目标值优先取下一关键帧的 s，缺失时回退到当前关键帧的 e（与 lottie 一致）
+      let end = value_vec(b.get("s").or_else(|| a.get("e")), dim, &start);
       return (0..dim)
         .map(|j| {
           start.get(j).copied().unwrap_or(0.0)
@@ -404,17 +408,17 @@ fn prop_f32_array(prop: Option<&Value>, frame: f32) -> Vec<f32> {
       }
       let raw = if tb > ta { (time - ta) / (tb - ta) } else { 0.0 };
       let (x1, y1) = easing_pair(a.get("o"));
-      let (x2, y2) = easing_pair(b.get("i"));
+      let (x2, y2) = easing_pair(a.get("i"));
       let eased = if x1 == 0.0 && y1 == 0.0 && x2 == 1.0 && y2 == 1.0 {
         raw
       } else {
         bezier_y(raw, x1, y1, x2, y2)
       };
       let start = parse(a.get("s"));
-      let end = if a.get("e").is_some() {
-        parse(a.get("e"))
-      } else {
+      let end = if b.get("s").is_some() {
         parse(b.get("s"))
+      } else {
+        parse(a.get("e"))
       };
       let n = start.len().max(end.len());
       return (0..n)
@@ -735,13 +739,12 @@ fn path_data_at(prop: &Value, frame: f32) -> Option<PathData> {
         return parse_path_data(a.get("s")?);
       }
       let start = parse_path_data(a.get("s")?)?;
-      let end = match a.get("e") {
-        Some(e) => parse_path_data(e)?,
-        None => parse_path_data(b.get("s")?)?,
+      let Some(end) = b.get("s").or_else(|| a.get("e")).and_then(parse_path_data) else {
+        return Some(start);
       };
       let raw = if tb > ta { (frame - ta) / (tb - ta) } else { 0.0 };
       let (x1, y1) = easing_pair(a.get("o"));
-      let (x2, y2) = easing_pair(b.get("i"));
+      let (x2, y2) = easing_pair(a.get("i"));
       let t = if x1 == 0.0 && y1 == 0.0 && x2 == 1.0 && y2 == 1.0 {
         raw
       } else {
@@ -1116,13 +1119,17 @@ fn path_length(path: &Path) -> f32 {
 
 /// 把归一化区间 [s, e]（可带旋转偏移 o）转成 0~1 的多段区间；闭环时支持环绕
 fn trim_ranges(s: f32, e: f32, o: f32, closed: bool) -> Vec<(f32, f32)> {
-  let start = s + o;
-  let end = e + o;
-  if !closed {
-    let a = start.min(end).clamp(0.0, 1.0);
-    let b = start.max(end).clamp(0.0, 1.0);
-    return if b > a { vec![(a, b)] } else { Vec::new() };
+  let mut start = s + o;
+  let mut end = e + o;
+  // 与 lottie-web（TrimModifier.processShapes）对齐：起始值大于结束值时必须交换，
+  // 而不是返回空；AE 里「反向裁剪」就是靠这个语义显示的。
+  if start > end {
+    std::mem::swap(&mut start, &mut end);
   }
+  // lottie 会把区间四舍五入到 0.0001 精度，相等即视为无几何
+  start = (start * 10000.0).round() / 10000.0;
+  end = (end * 10000.0).round() / 10000.0;
+  let _ = closed;
   if end <= start {
     return Vec::new();
   }
@@ -1419,14 +1426,35 @@ fn parse_hex_color(text: &str) -> [f32; 4] {
 // 形状组遍历
 // ---------------------------------------------------------------------------
 
+fn trim_spec(item: &Value, frame: f32) -> Option<(f32, f32, f32, bool)> {
+  if item.get("ty").and_then(|t| t.as_str()) != Some("tm") {
+    return None;
+  }
+  let s = (prop_f32(item.get("s"), frame, 0.0) / 100.0).clamp(0.0, 1.0);
+  let e = (prop_f32(item.get("e"), frame, 100.0) / 100.0).clamp(0.0, 1.0);
+  // lottie-web: o = (o.v % 360) / 360，负角度回绕到 [0,1)
+  let mut o = (prop_f32(item.get("o"), frame, 0.0) % 360.0) / 360.0;
+  if o < 0.0 {
+    o += 1.0;
+  }
+  // m=1 同时（组合长度），m=2 单独（每条路径各裁一段）
+  let individually = as_f32(item.get("m"), 1.0) >= 2.0;
+  Some((s, e, o, individually))
+}
+
 fn walk_items(
   items: &[Value],
   base: Mat,
   alpha: f32,
   frame: f32,
+  inherited_trim: Option<(f32, f32, f32, bool)>,
 ) -> (Vec<Paint>, Vec<Geom>, Vec<Path>) {
   let mut paints: Vec<Paint> = Vec::new();
   let mut geoms: Vec<Geom> = Vec::new();
+  // 本作用域的 trim：优先取自身的 tm；自身没有时继承上层。
+  // AE 常把 tm 放在组外层（例如 [组(路径+描边), tm]），它必须同时裁剪组内路径。
+  let scope_trim = items.iter().find_map(|i| trim_spec(i, frame)).or(inherited_trim);
+  let mut trim_applied = false;
   // 组内 `tr` 决定本组变换与不透明度
   let mut mat = base;
   let mut group_alpha = alpha;
@@ -1440,6 +1468,14 @@ fn walk_items(
 
   for (index, item) in items.iter().enumerate() {
     let ty = item.get("ty").and_then(|t| t.as_str()).unwrap_or("");
+    // 画笔按当前路径列表生成几何：若本作用域存在 trim（含从上层继承的），
+    // 必须在三角化之前先裁剪，否则描边/填充会按完整路径生成。
+    if matches!(ty, "fl" | "st" | "gf" | "gs") && !trim_applied {
+      if let Some((s, e, o, individually)) = scope_trim {
+        paths = apply_trim(&paths, s, e, o, individually);
+      }
+      trim_applied = true;
+    }
     match ty {
       "rp" => {
         // 重复器：复制它前面的全部形状与样式，每个副本套一层变换与不透明度
@@ -1457,7 +1493,7 @@ fn walk_items(
             let copy = if reversed { copies - 1 - step } else { step } as f32;
             let copy_mat = mat.mul(&repeater_matrix(item, frame, copy + offset));
             let copy_alpha = group_alpha * repeater_opacity(item, frame, copy, copies_f);
-            let (child_paints, mut child_geoms, _) = walk_items(&prefix, copy_mat, copy_alpha, frame);
+            let (child_paints, mut child_geoms, _) = walk_items(&prefix, copy_mat, copy_alpha, frame, scope_trim);
             let paint_offset = paints.len();
             for geom in &mut child_geoms {
               if geom.image.is_none() {
@@ -1478,7 +1514,7 @@ fn walk_items(
       }
       "gr" => {
         if let Some(child) = item.get("it").and_then(|i| i.as_array()) {
-          let (child_paints, mut child_geoms, child_paths) = walk_items(child, mat, group_alpha, frame);
+          let (child_paints, mut child_geoms, child_paths) = walk_items(child, mat, group_alpha, frame, scope_trim);
           if child_geoms.is_empty() {
             // 子组没有任何画笔时，其路径并入本组，由本组的填充 / 描边统一绘制
             // （AE 导出常见：路径分组 + 组级 Gradient Fill）
@@ -1517,12 +1553,12 @@ fn walk_items(
         }
       }
       "tm" => {
-        let s = prop_f32(item.get("s"), frame, 0.0) / 100.0;
-        let e = prop_f32(item.get("e"), frame, 100.0) / 100.0;
-        let o = prop_f32(item.get("o"), frame, 0.0) / 360.0;
-        // m=1 同时（组合长度），m=2 单独（每条路径各裁一段）
-        let individually = as_f32(item.get("m"), 1.0) >= 2.0;
-        paths = apply_trim(&paths, s, e, o, individually);
+        if !trim_applied {
+          if let Some((s, e, o, individually)) = scope_trim {
+            paths = apply_trim(&paths, s, e, o, individually);
+          }
+          trim_applied = true;
+        }
       }
       "mm" => {
         // 合并模式在 check_shapes 已校验，这里只处理 mm=1（Merge）
@@ -1934,7 +1970,7 @@ fn compile_scope(
           .cloned()
           .unwrap_or_default();
         let dynamic = shapes.iter().any(has_animation);
-        let (paints, geoms, _) = walk_items(&shapes, Mat::identity(), 1.0, ip);
+        let (paints, geoms, _) = walk_items(&shapes, Mat::identity(), 1.0, ip, None);
         entry.geoms = geoms;
         entry.paints = paints;
         entry.dynamic = dynamic;
@@ -2032,10 +2068,10 @@ fn compile_scope(
   // 注意配对依据是 ind 而不是数组下标，且源图层不必带 td（td 只标记“这是遮罩源”）。
   // 同一个遮罩源可以被多个被遮罩图层复用，因此不能把分组 id 写回源图层。
   let ind_of = |value: &Value| value.get("ind").and_then(|v| v.as_f64());
-  let slot_by_ind = |ind: f64| -> Option<usize> {
+  let slot_by_ind = |ind: f64| -> Option<(usize, usize)> {
     raw.iter()
       .position(|layer| ind_of(layer) == Some(ind))
-      .and_then(|raw_index| entry_of_raw[raw_index])
+      .and_then(|raw_index| entry_of_raw[raw_index].map(|slot| (raw_index, slot)))
   };
   for idx in 0..raw.len() {
     let tt = raw[idx].get("tt").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
@@ -2048,17 +2084,17 @@ fn compile_scope(
     if out[mask_slot].group != 0 {
       continue;
     }
-    let src_slot = match raw[idx].get("tp").and_then(|v| v.as_f64()) {
+    let (src_raw, src_slot) = match raw[idx].get("tp").and_then(|v| v.as_f64()) {
       Some(tp) => match slot_by_ind(tp) {
-        Some(slot) => slot,
+        Some(pair) => pair,
         None => continue,
       },
       None => {
         let ind = ind_of(&raw[idx]);
         match ind.and_then(|value| slot_by_ind(value - 1.0)) {
-          Some(slot) => slot,
+          Some(pair) => pair,
           None => match idx.checked_sub(1).and_then(|prev| entry_of_raw[prev]) {
-            Some(slot) => slot,
+            Some(slot) => (idx - 1, slot),
             None => continue,
           },
         }
@@ -2068,7 +2104,13 @@ fn compile_scope(
       continue;
     }
     let gid = ctx.next_group();
-    out[src_slot].role = 1;
+    // td 只表示「本层作为遮罩源，不单独绘制」。若源层没有 td（真实导出里少见，
+    // 但手工数据/工具生成数据可能出现），lottie 仍会把它当普通图层画出来，
+    // 这里保持同样的可见性，避免整层消失。
+    let src_has_td = raw[src_raw].get("td").and_then(|v| v.as_f64()).unwrap_or(0.0) > 0.0;
+    if src_has_td {
+      out[src_slot].role = 1;
+    }
     out[mask_slot].group = gid;
     out[mask_slot].role = 2;
     out[mask_slot].matte_mode = tt as u32;
@@ -2592,7 +2634,7 @@ impl<'a> Renderer<'a> {
         .cloned()
         .unwrap_or_default();
       let local = self.frame - layer.time_offset;
-      let (p, g, _) = walk_items(&shapes, Mat::identity(), 1.0, local);
+      let (p, g, _) = walk_items(&shapes, Mat::identity(), 1.0, local, None);
       dyn_paints = p;
       dyn_geoms = g;
       (dyn_geoms.as_slice(), dyn_paints.as_slice())
@@ -3230,15 +3272,17 @@ mod tests {
     let mut group = 0;
     for b in 0..batch_count {
       let header = 3 + b * BATCH_WORDS;
-      let role = words[header + 56];
+      // 字尾布局随 MAX_STOPS 变化，这里按常量推算而不是写死偏移
+      let tail = 13 + MAX_STOPS * 5;
+      let role = words[header + tail + 3];
       if role == 1 {
         source_batches += 1;
-        group = words[header + 54];
+        group = words[header + tail + 1];
       }
       if role == 2 {
         masked_batches += 1;
-        assert_eq!(words[header + 54], group, "遮罩两端应属于同一分组");
-        assert_eq!(words[header + 55], 1, "alpha 遮罩模式");
+        assert_eq!(words[header + tail + 1], group, "遮罩两端应属于同一分组");
+        assert_eq!(words[header + tail + 2], 1, "alpha 遮罩模式");
       }
     }
     assert!(source_batches > 0 && masked_batches > 0, "缺少遮罩批次");
