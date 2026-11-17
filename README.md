@@ -11,22 +11,26 @@
 
 ## 支持范围
 
-当前覆盖形状动画 MVP：
+当前覆盖形状动画与常见特效：
 
 | 类别 | 支持项 |
 | --- | --- |
-| 图层 | 形状图层（`ty=4`）、嵌套组（`gr` / `tr`）、图层父子关系（`parent`） |
-| 形状 | 矩形 `rc`（含圆角）、椭圆 `el`、贝塞尔路径 `sh` |
-| 画笔 | 纯色填充 `fl`、纯色描边 `st`、线性/径向渐变填充 `gf`（`gs` 取首色标近似） |
-| 变换 | 位置 / 锚点 / 缩放 / 旋转 / 不透明度关键帧与缓动 |
+| 图层 | 形状（`ty=4`）、纯色（`ty=1`）、图片（`ty=2`）、空图层（`ty=3`）、预合成（`ty=0`）、3D 相机（`ty=13`，仅顶层 comp） |
+| 形状 | 矩形 `rc`（含圆角）、椭圆 `el`、贝塞尔 `sh`、组 `gr`/`tr`、trim path `tm`、合并路径 `mm`（1/2/5，Exclude 用绕向反转实现） |
+| 画笔 | 纯色填充 `fl`、纯色描边 `st`、线性/径向渐变填充 `gf`、渐变描边 `gs` |
+| 蒙版 | `masksProperties`（a/s/i/n）、扩张/收缩 `x`（轮廓法线偏移）、轨道遮罩（alpha / 反相 alpha） |
+| 特效 | 高斯模糊 `ef ty=29`，多层模糊按方差可加合并为一次等效 sigma（`σ=√Σσᵢ²`） |
+| 3D | 图层 `rx/ry/rz` + 透视；有相机时 parent/container 链统一走 4×4 世界矩阵，投影后补偿 comp 中心 |
+| 变换 | 位置 / 锚点 / 缩放 / 旋转 / 不透明度关键帧与缓动，父子关系与预合成嵌套 |
 
-暂不支持：路径形变关键帧（取首帧）、文本、图片、遮罩、表达式、3D 图层。遇到不支持的图层前端可自动回退到原始 Lottie 渲染。
+暂不支持（显式报错并由前端回退 canvas，不静默画错）：文本图层（需字体轮廓）、未烘焙的表达式、非高斯图层特效（发光/投影/色阶等）、亮度轨道遮罩、星形/重复器等形状修饰器、合并路径的 `mm=3 Subtract` / `mm=4 Intersect`、预合成内部的 3D 相机。
 
 ## 目录结构
 
 ```
 src/lib.rs              核心实现与单元测试
 scripts/check.mjs       用 Node 加载 wasm、跑样例动画的冒烟脚本
+scripts/verify-demos.mjs 用 Node 校验指定的单个 Lottie JSON（构造特性数据用）
 public/animations/      Lottie 样例 JSON
 dist/lottie2shader.wasm 构建产物
 ```
@@ -48,7 +52,13 @@ cargo test                 # Rust 侧单元测试
 node scripts/check.mjs     # 冒烟测试：编译并渲染 public/animations 下的样例
 ```
 
-冒烟脚本可用环境变量 `L2S_WASM` 指定其他 wasm 路径。
+冒烟脚本可用环境变量 `L2S_WASM` 指定其他 wasm 路径。`scripts/verify-demos.mjs` 用于校验构造出来的单个 JSON（例如多模糊叠加、3D 相机这类真实样例里没有的特性）：
+
+```powershell
+$env:L2S_WASM="D:\sgames\3d-slide\src\lib\lottieShader\lottie2shader.wasm"
+$env:L2S_FILES="D:/path/camera-demo.json;D:/path/blur-stack-demo.json"
+node scripts/verify-demos.mjs
+```
 
 ## WASM 接口
 
@@ -80,10 +90,14 @@ const words = new Uint32Array(ex.memory.buffer, ex.l2s_result_ptr(), ex.l2s_resu
 小端 `u32` 序列：
 
 1. `batchCount`
-2. `batchCount` 个批次头，每个 53 字（`13 + 8 × 5`）
-3. 共享顶点数组（`f32 x, y` 成对，位模式存放）
+2. `vertexCount`（浮点对 `x, y` 的个数）
+3. `uvCount`（浮点对 `u, v` 的个数）
+4. `batchCount` 个批次头，每个 `BATCH_WORDS = 104` 字
+5. 共享顶点数组（`f32 x, y` 成对，位模式存放）
+6. 共享 UV 数组（`f32 u, v` 成对）
+7. 尾部：pass 记录（模糊离屏合成）与 mask 记录（蒙版覆盖几何）
 
-批次头字段顺序：
+批次头字段顺序（前 13 字 + 16×5 色标 + 9 字，其余补零）：
 
 ```
 kind, first, count,
@@ -91,10 +105,13 @@ color.r, color.g, color.b, color.a,
 alpha,
 p0.x, p0.y, p1.x, p1.y,
 stopCount,
-8 × (offset, r, g, b, a)   // 不足 8 个补零
+16 × (offset, r, g, b, a)   // 不足补零
+uvFirst, group, matte, role, image, passId, blend, layer, parent
 ```
 
-`kind`：`0` 纯色、`1` 线性渐变、`2` 径向渐变；`first` / `count` 为共享顶点数组中的起始索引与顶点数，前端按此区间 `drawArrays`。所有顶点已按目标画布缩放，坐标即渲染坐标。
+`kind`：`0` 纯色、`1` 线性渐变、`2` 径向渐变、`3` 图片、`5` 蒙版覆盖、`6` 全屏四边形；`first` / `count` 为共享顶点数组中的起始索引与顶点数，前端按此区间 `drawArrays`。`image` 为图片资源下标（`u32::MAX` 表示非图片），`passId` 指向尾部的离屏 pass 记录（`u32::MAX` 表示直接绘制）。
+
+pass 记录（10 字）：`id, firstBatch, batchCount, wrap, sigmaX, sigmaY, group, maskFirst, maskCount, 0`，其中 `sigmaX/sigmaY` 是已合并的画布像素 σ，`wrap` 表示边缘模式为 repeat。mask 记录（6 字）描述每条蒙版的运算与覆盖批次。所有顶点已按目标画布缩放，坐标即渲染坐标。
 
 ## 依赖
 

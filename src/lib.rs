@@ -18,11 +18,12 @@
 //! - 合并路径（mm：1 Merge / 2 Add / 5 Exclude，Exclude 用绕向反转精确实现异或）；
 //! - 图层蒙版（masksProperties，a/s/i/n 四种模式）与扩张/收缩（x，按轮廓法线偏移实现）；
 //! - 轨道遮罩（tt=1/2，alpha 与反相 alpha）；亮度遮罩不支持；
-//! - 3D 图层的 rx/ry/rz 旋转与透视投影（不含 3D 相机）；
+//! - 3D 图层的 rx/ry/rz 旋转与透视投影；顶层 3D 相机（ty=13，位置/目标点/透视距离
+//!   逐帧求值，parent/container 链在有相机时统一走 4×4 世界矩阵）；
 //! - 图层与组的变换、不透明度关键帧、父子关系、预合成嵌套。
 //!
 //! 明确不支持的特性会直接返回错误，由前端注册中心回退到 canvas，绝不静默画错：
-//! 文本图层（需要字体轮廓）、表达式（需要 JS 引擎）、图层特效（多特效叠加）、
+//! 文本图层（需要字体轮廓）、表达式（需要 JS 引擎）、非高斯图层特效、预合成内的
 //! 3D 相机、亮度轨道遮罩、星形/重复器等形状修饰器，以及合并路径的
 //! Intersect（mm=4，需要真正的多边形裁剪）。
 
@@ -193,21 +194,75 @@ impl Mat4 {
     Mat4([c, -s, 0.0, 0.0, s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
   }
 
-  /// 以透视距离 pe 投影到 z=0 平面（相机位于 z=-pe）
+  /// 以透视距离 pe 投影到屏幕（相机位于 z=-pe，朝 +z 看）
+  ///
+  /// 图层几何都落在自身平面 z=0 上，所以第三列（z 方向）不参与；
+  /// 但平移列（m03/m13/m23）必须保留，否则图层位置与 3D 深度会全部丢失。
   fn project(&self, pe: f32) -> Mat {
     let pe = if pe > 0.0 { pe } else { 800.0 };
     Mat([
       pe * self.0[0],
       pe * self.0[1],
-      pe * self.0[2],
+      pe * self.0[3],
       pe * self.0[4],
       pe * self.0[5],
-      pe * self.0[6],
+      pe * self.0[7],
       self.0[8],
       self.0[9],
-      pe + self.0[10],
+      pe + self.0[11],
     ])
   }
+
+  /// 把 2D 仿射矩阵提升成 4×4（视为贴在 z=0 平面上，z 保持不变）
+  fn from_mat(m: &Mat) -> Self {
+    Mat4([
+      m.0[0], m.0[1], 0.0, m.0[2],
+      m.0[3], m.0[4], 0.0, m.0[5],
+      0.0, 0.0, 1.0, 0.0,
+      0.0, 0.0, 0.0, 1.0,
+    ])
+  }
+}
+
+/// 由相机位置与目标点构造「世界 → 相机」视图矩阵。
+///
+/// `Mat4::project` 的约定是「相机在 z=-zoom 朝 +z 看、屏幕 y 与世界 y 同向」，
+/// 所以这里把相机前方映射到 +z，up 取 +y，x 轴由 up × forward 得到，
+/// 相机正对 comp 平面时该矩阵退化为纯平移（与原 2D 行为一致）。
+fn camera_view_matrix(pos: [f32; 3], poi: [f32; 3]) -> Mat4 {
+  let mut forward = [poi[0] - pos[0], poi[1] - pos[1], poi[2] - pos[2]];
+  let len = (forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]).sqrt();
+  forward = if len < 1.0e-4 {
+    [0.0, 0.0, 1.0]
+  } else {
+    [forward[0] / len, forward[1] / len, forward[2] / len]
+  };
+  let mut up = [0.0f32, 1.0, 0.0];
+  // 与 forward 正交化：相机沿 +y 方向看时退化为用 -z 当参考
+  let dot = up[0] * forward[0] + up[1] * forward[1] + up[2] * forward[2];
+  up = [
+    up[0] - forward[0] * dot,
+    up[1] - forward[1] * dot,
+    up[2] - forward[2] * dot,
+  ];
+  let len = (up[0] * up[0] + up[1] * up[1] + up[2] * up[2]).sqrt();
+  up = if len < 1.0e-4 {
+    [0.0, 0.0, -1.0]
+  } else {
+    [up[0] / len, up[1] / len, up[2] / len]
+  };
+  let right = [
+    up[1] * forward[2] - up[2] * forward[1],
+    up[2] * forward[0] - up[0] * forward[2],
+    up[0] * forward[1] - up[1] * forward[0],
+  ];
+  let dot3 = |v: [f32; 3]| v[0] * pos[0] + v[1] * pos[1] + v[2] * pos[2];
+  Mat4([
+    right[0], right[1], right[2], -dot3(right),
+    up[0], up[1], up[2], -dot3(up),
+    forward[0], forward[1], forward[2], -dot3(forward),
+    0.0, 0.0, 0.0, 1.0,
+  ])
 }
 
 // ---------------------------------------------------------------------------
@@ -446,10 +501,10 @@ fn tr_matrix(tr: &Value, frame: f32) -> Mat {
     .mul(&Mat::translate(-a[0], -a[1]))
 }
 
-/// 图层变换：3D 图层用完整 3D 变换 + 透视投影，其余走 2D 仿射
-fn layer_matrix(ks: &Value, frame: f32, ddd: bool, pe: f32) -> Mat {
+/// 图层自身的 4×4 变换：3D 图层用完整 rx/ry/rz，2D 图层按 z=0 平面提升
+fn layer_matrix4(ks: &Value, frame: f32, ddd: bool) -> Mat4 {
   if !ddd {
-    return tr_matrix(ks, frame);
+    return Mat4::from_mat(&tr_matrix(ks, frame));
   }
   let p = prop_vec(ks.get("p"), frame, 3, &[0.0, 0.0, 0.0]);
   let a = prop_vec(ks.get("a"), frame, 3, &[0.0, 0.0, 0.0]);
@@ -458,13 +513,20 @@ fn layer_matrix(ks: &Value, frame: f32, ddd: bool, pe: f32) -> Mat {
   let ry = prop_f32(ks.get("ry"), frame, 0.0).to_radians();
   let rx = prop_f32(ks.get("rx"), frame, 0.0).to_radians();
   // Lottie / AE 的欧拉顺序：先 Z，再 Y，最后 X
-  let m = Mat4::translate(p[0], p[1], p[2])
+  Mat4::translate(p[0], p[1], p[2])
     .mul(&Mat4::rotate_z(rz))
     .mul(&Mat4::rotate_y(ry))
     .mul(&Mat4::rotate_x(rx))
     .mul(&Mat4::scale(s[0] / 100.0, s[1] / 100.0, s[2] / 100.0))
-    .mul(&Mat4::translate(-a[0], -a[1], -a[2]));
-  m.project(pe)
+    .mul(&Mat4::translate(-a[0], -a[1], -a[2]))
+}
+
+/// 图层变换：3D 图层用完整 3D 变换 + 透视投影，其余走 2D 仿射
+fn layer_matrix(ks: &Value, frame: f32, ddd: bool, pe: f32) -> Mat {
+  if !ddd {
+    return tr_matrix(ks, frame);
+  }
+  layer_matrix4(ks, frame, true).project(pe)
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +588,13 @@ struct Layer {
 
 /// 图层高斯模糊参数（数值保持原始属性，渲染时再按帧求值）
 struct BlurFx {
+  /// 图层上每个已启用的高斯模糊；多个模糊叠加时按「方差可加」合并成等效 sigma
+  params: Vec<BlurParam>,
+}
+
+/// 单个高斯模糊（ef ty=29）的三项参数：模糊量、方向、边缘模式
+#[derive(Clone)]
+struct BlurParam {
   blurriness: Value,
   dimensions: Value,
   edge: Value,
@@ -561,6 +630,16 @@ struct Compiled {
   layers: Vec<Layer>,
   roots: Vec<usize>,
   images: Vec<ImageAsset>,
+  /// 顶层 comp 的 3D 相机（存在时所有图层统一走相机视图 + 透视）
+  camera: Option<CameraSpec>,
+}
+
+/// 3D 相机（ty=13）：位置、目标点与透视距离，三者都可能带关键帧，渲染时逐帧求值
+#[derive(Clone)]
+struct CameraSpec {
+  pos: Value,
+  poi: Value,
+  zoom: Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -1884,25 +1963,35 @@ fn enabled_effects(layer: &Value) -> Vec<&Value> {
     .unwrap_or_default()
 }
 
-/// 解析高斯模糊（ef ty=29）：lottie 的 effectElements 顺序是
+/// 解析图层上的所有高斯模糊（ef ty=29）：lottie 的 effectElements 顺序是
 /// [Blurriness, Blur Dimensions, Edge Mode]，直接按位置取值。
+/// 其它特效类型在 check_layers 阶段已直接拒绝，这里只收集模糊。
 fn layer_blur(layer: &Value) -> Option<BlurFx> {
-  let effects = enabled_effects(layer);
-  let effect = effects.iter().find(|ef| as_f32(ef.get("ty"), 0.0) == 29.0)?;
-  let params = effect.get("ef")?.as_array()?;
-  // 参数缺省时按 lottie 默认值补齐，避免「有模糊效果却未生效」的静默错误
-  let value = |i: usize, def: f32| -> Value {
-    params
-      .get(i)
-      .and_then(|p| p.get("v"))
-      .cloned()
-      .unwrap_or(Value::from(def))
-  };
-  Some(BlurFx {
-    blurriness: value(0, 0.0),
-    dimensions: value(1, 1.0),
-    edge: value(2, 0.0),
-  })
+  let params: Vec<BlurParam> = enabled_effects(layer)
+    .iter()
+    .filter(|effect| as_f32(effect.get("ty"), 0.0) == 29.0)
+    .filter_map(|effect| {
+      let list = effect.get("ef")?.as_array()?;
+      // 参数缺省时按 lottie 默认值补齐，避免「有模糊效果却未生效」的静默错误
+      let value = |i: usize, def: f32| -> Value {
+        list
+          .get(i)
+          .and_then(|p| p.get("v"))
+          .cloned()
+          .unwrap_or(Value::from(def))
+      };
+      Some(BlurParam {
+        blurriness: value(0, 0.0),
+        dimensions: value(1, 1.0),
+        edge: value(2, 0.0),
+      })
+    })
+    .collect();
+  if params.is_empty() {
+    None
+  } else {
+    Some(BlurFx { params })
+  }
 }
 
 /// 解析图层蒙版；mode 映射为 0 加 / 1 减 / 2 交 / 3 忽略
@@ -1960,7 +2049,12 @@ fn check_layers(
       }
       1 | 2 | 3 | 4 => {}
       5 => return Err("文本图层需要字体轮廓，暂不支持".to_string()),
-      13 => return Err("3D 相机图层暂不支持".to_string()),
+      13 => {
+        // 3D 相机：只有顶层 comp 的相机参与渲染，预合成内的相机需要独立视图
+        if depth > 0 {
+          return Err("预合成内的 3D 相机暂不支持".to_string());
+        }
+      }
       other => return Err(format!("不支持的图层类型 ty={other}")),
     }
     if let Some(masks) = layer.get("masksProperties").and_then(|m| m.as_array()) {
@@ -1980,19 +2074,22 @@ fn check_layers(
     }
     let effects = enabled_effects(layer);
     if !effects.is_empty() {
-      if effects.len() > 1 {
-        return Err("多个图层特效叠加暂不支持（请回退 canvas 渲染）".to_string());
+      // 多层高斯模糊可以叠加：高斯卷积的方差可加，渲染时合并成等效 sigma；
+      // 其它特效（发光、投影、色阶等）没有等价实现，仍交回 canvas
+      if let Some(other) = effects.iter().find(|ef| as_f32(ef.get("ty"), 0.0) != 29.0) {
+        return Err(format!(
+          "不支持的图层特效 ty={}（仅支持高斯模糊）",
+          as_f32(other.get("ty"), 0.0) as i64
+        ));
       }
-      let ty_effect = as_f32(effects[0].get("ty"), 0.0) as i64;
-      if ty_effect != 29 {
-        return Err(format!("不支持的图层特效 ty={ty_effect}（仅支持高斯模糊）"));
-      }
-      let params = effects[0]
-        .get("ef")
-        .and_then(|p| p.as_array())
-        .ok_or_else(|| "高斯模糊缺少参数".to_string())?;
-      if params.len() < 2 || params.first().and_then(|p| p.get("v")).is_none() {
-        return Err("高斯模糊参数不完整".to_string());
+      for effect in &effects {
+        let params = effect
+          .get("ef")
+          .and_then(|p| p.as_array())
+          .ok_or_else(|| "高斯模糊缺少参数".to_string())?;
+        if params.len() < 2 || params.first().and_then(|p| p.get("v")).is_none() {
+          return Err("高斯模糊参数不完整".to_string());
+        }
       }
     }
     if ty == 4 {
@@ -2357,6 +2454,20 @@ fn compile_doc(doc: &Value, width: f32, height: f32) -> Result<Compiled, String>
     layers,
     roots,
     images: ctx.images,
+    camera: camera_of(raw_layers),
+  })
+}
+
+/// 取顶层 comp 的 3D 相机（AE 一个合成只用一个相机生效，取第一个）
+fn camera_of(layers: &[Value]) -> Option<CameraSpec> {
+  let layer = layers
+    .iter()
+    .find(|l| l.get("ty").and_then(|t| t.as_f64()).unwrap_or(0.0) as i64 == 13)?;
+  let ks = layer.get("ks").cloned().unwrap_or(Value::Null);
+  Some(CameraSpec {
+    pos: ks.get("p").cloned().unwrap_or(Value::Null),
+    poi: ks.get("a").cloned().unwrap_or(Value::Null),
+    zoom: layer.get("pe").cloned().unwrap_or(Value::Null),
   })
 }
 
@@ -2422,6 +2533,11 @@ struct Renderer<'a> {
   c: &'a Compiled,
   frame: f32,
   world_memo: Vec<Option<Mat>>,
+  /// 有相机时使用的 4×4 世界矩阵（整条 parent/container 链在 4×4 上相乘）
+  world4_memo: Vec<Option<Mat4>>,
+  visiting4: Vec<bool>,
+  /// 当前帧的相机视图与透视距离（None 表示没有相机或本帧无相机）
+  view_memo: Option<Option<(Mat4, f32)>>,
   active_memo: Vec<Option<bool>>,
   alpha_memo: Vec<Option<f32>>,
   visiting: Vec<bool>,
@@ -2442,6 +2558,9 @@ impl<'a> Renderer<'a> {
       c,
       frame,
       world_memo: vec![None; n],
+      world4_memo: vec![None; n],
+      visiting4: vec![false; n],
+      view_memo: None,
       active_memo: vec![None; n],
       alpha_memo: vec![None; n],
       visiting: vec![false; n],
@@ -2454,6 +2573,65 @@ impl<'a> Renderer<'a> {
       pass_index: HashMap::new(),
       masks: Vec::new(),
     }
+  }
+
+  /// 逐帧求相机视图；没有相机时返回 None（各图层退回自身 pe 的局部透视）
+  fn camera_view(&mut self) -> Option<(Mat4, f32)> {
+    if let Some(v) = self.view_memo {
+      return v;
+    }
+    let view = match self.c.camera.clone() {
+      None => None,
+      Some(cam) => {
+        let pos = prop_vec(
+          Some(&cam.pos),
+          self.frame,
+          3,
+          &[self.c.doc_w / 2.0, self.c.doc_h / 2.0, 0.0],
+        );
+        let pos = [pos[0], pos[1], pos[2]];
+        // 目标点缺省为位置正前方（z 方向），也就是 AE 相机默认的视线
+        let poi = prop_vec(Some(&cam.poi), self.frame, 3, &[pos[0], pos[1], pos[2] + 1000.0]);
+        let poi = [poi[0], poi[1], poi[2]];
+        let zoom = prop_f32(Some(&cam.zoom), self.frame, 800.0).max(1.0);
+        Some((camera_view_matrix(pos, poi), zoom))
+      }
+    };
+    self.view_memo = Some(view);
+    view
+  }
+
+  /// 4×4 世界矩阵（只在有相机时使用）
+  fn world4_of(&mut self, i: usize) -> Mat4 {
+    if let Some(m) = self.world4_memo[i] {
+      return m;
+    }
+    if self.visiting4[i] {
+      return Mat4::identity();
+    }
+    self.visiting4[i] = true;
+    let (frame, ddd, ks, parent, container) = {
+      let layer = &self.c.layers[i];
+      (
+        self.frame - layer.time_offset,
+        layer.ddd,
+        layer.ks.clone(),
+        layer.parent,
+        layer.container,
+      )
+    };
+    let local = layer_matrix4(&ks, frame, ddd);
+    let base = if let Some(parent) = parent {
+      self.world4_of(parent)
+    } else if let Some(container) = container {
+      self.world4_of(container)
+    } else {
+      Mat4::identity()
+    };
+    let world = base.mul(&local);
+    self.visiting4[i] = false;
+    self.world4_memo[i] = Some(world);
+    world
   }
 
   /// 预合成 / 蒙版图层是否需要独立离屏 pass
@@ -2472,27 +2650,41 @@ impl<'a> Renderer<'a> {
       return;
     }
     let local = self.frame - self.c.layers[id as usize].time_offset;
-    let (blurriness, dimensions, edge) = match &self.c.layers[id as usize].blur {
-      Some(b) => (
-        prop_f32(Some(&b.blurriness), local, 0.0),
-        prop_f32(Some(&b.dimensions), local, 1.0) as i32,
-        prop_f32(Some(&b.edge), local, 0.0) as i32,
-      ),
-      None => (0.0, 1i32, 0),
-    };
     let world = self.world_of(id as usize);
     let sx = self.c.width / self.c.doc_w;
     let sy = self.c.height / self.c.doc_h;
-    // lottie：sigma = 0.3 * Blurriness（图层局部坐标），再乘以世界缩放与画布缩放
-    let k = 0.3 * blurriness * world.scale_factor();
-    let sigma_x = if dimensions == 3 { 0.0 } else { k * sx };
-    let sigma_y = if dimensions == 2 { 0.0 } else { k * sy };
+    let world_scale = world.scale_factor();
+    // 多个高斯模糊依次作用，方差可加：σ_total = √(Σσᵢ²)
+    let mut sigma_sq_x = 0.0f32;
+    let mut sigma_sq_y = 0.0f32;
+    let mut wrap = false;
+    if let Some(blur) = &self.c.layers[id as usize].blur {
+      for param in &blur.params {
+        let blurriness = prop_f32(Some(&param.blurriness), local, 0.0);
+        let dimensions = prop_f32(Some(&param.dimensions), local, 1.0) as i32;
+        let edge = prop_f32(Some(&param.edge), local, 0.0) as i32;
+        // 最后一个模糊的边界模式决定合成后的边缘处理
+        wrap = edge == 1;
+        // lottie：sigma = 0.3 * Blurriness（图层局部坐标），再乘以世界缩放与画布缩放
+        let k = 0.3 * blurriness * world_scale;
+        if dimensions != 3 {
+          let value = k * sx;
+          sigma_sq_x += value * value;
+        }
+        if dimensions != 2 {
+          let value = k * sy;
+          sigma_sq_y += value * value;
+        }
+      }
+    }
+    let sigma_x = sigma_sq_x.sqrt();
+    let sigma_y = sigma_sq_y.sqrt();
     let index = self.passes.len();
     self.passes.push(PassRec {
       id,
       sigma_x,
       sigma_y,
-      wrap: edge == 1,
+      wrap,
       mask_first: usize::MAX,
       mask_count: 0,
       // 区间由 add_batch 按实际批次回填：pass 刚创建时可能还没有任何批次
@@ -2655,16 +2847,57 @@ impl<'a> Renderer<'a> {
       return Mat::identity();
     }
     self.visiting[i] = true;
-    let layer = &self.c.layers[i];
-    let local = layer_matrix(&layer.ks, self.frame - layer.time_offset, layer.ddd, layer.pe);
-    let base = if let Some(parent) = layer.parent {
-      self.world_of(parent)
-    } else if let Some(container) = layer.container {
-      self.world_of(container)
-    } else {
-      Mat::identity()
+    let view = self.camera_view();
+    let (frame, ddd, pe, ks, parent, container) = {
+      let layer = &self.c.layers[i];
+      (
+        self.frame - layer.time_offset,
+        layer.ddd,
+        layer.pe,
+        layer.ks.clone(),
+        layer.parent,
+        layer.container,
+      )
     };
-    let world = base.mul(&local);
+    let world = match view {
+      // 有相机：整条链在 4×4 上相乘，最后统一乘视图矩阵并投影
+      Some((view, zoom)) => {
+        let base = if let Some(parent) = parent {
+          self.world4_of(parent)
+        } else if let Some(container) = container {
+          self.world4_of(container)
+        } else {
+          Mat4::identity()
+        };
+        let mat = view.mul(&base).mul(&layer_matrix4(&ks, frame, ddd)).project(zoom);
+        // 相机视图以相机自身为原点，投影回屏幕时把 comp 中心补偿回来：
+        // 屏幕 = (doc_w/2, doc_h/2) + 相机投影，等价于给齐次坐标的 x/y 行各加「中心 × w 行」
+        let m = mat.0;
+        let (cx, cy) = (self.c.doc_w / 2.0, self.c.doc_h / 2.0);
+        Mat([
+          m[0] + cx * m[6],
+          m[1] + cx * m[7],
+          m[2] + cx * m[8],
+          m[3] + cy * m[6],
+          m[4] + cy * m[7],
+          m[5] + cy * m[8],
+          m[6],
+          m[7],
+          m[8],
+        ])
+      }
+      None => {
+        let local = layer_matrix(&ks, frame, ddd, pe);
+        let base = if let Some(parent) = parent {
+          self.world_of(parent)
+        } else if let Some(container) = container {
+          self.world_of(container)
+        } else {
+          Mat::identity()
+        };
+        base.mul(&local)
+      }
+    };
     self.visiting[i] = false;
     self.world_memo[i] = Some(world);
     world
@@ -3520,6 +3753,93 @@ mod tests {
   }
 
   #[test]
+  fn three_d_layer_position_is_preserved() {
+    // 3D 图层的平移必须进入投影：旧实现丢掉平移列，位置会塌到原点
+    let mut layer = base_layer(serde_json::json!([rect_group(
+      serde_json::json!({"ty": "fl", "c": {"a": 0, "k": [1, 0, 0, 1]}, "o": {"a": 0, "k": 100}})
+    )]));
+    layer["ddd"] = serde_json::json!(1);
+    layer["pe"] = serde_json::json!(800);
+    let doc = serde_json::json!({
+      "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+      "layers": [layer]
+    });
+    let words = read_words(&render_frame(&compile_doc(&doc, 400.0, 400.0).expect("compile"), 0.0));
+    let base = vertex_base(&words);
+    let count = words[1] as usize;
+    let mut center = [0.0f32, 0.0f32];
+    for i in 0..count {
+      let v = read_vertex(&words, base, i);
+      center[0] += v[0];
+      center[1] += v[1];
+    }
+    center[0] /= count as f32;
+    center[1] /= count as f32;
+    assert!((center[0] - 200.0).abs() < 1.0, "x 中心 {}", center[0]);
+    assert!((center[1] - 200.0).abs() < 1.0, "y 中心 {}", center[1]);
+  }
+
+  #[test]
+  fn camera_scales_and_centers_projection() {
+    // 相机在 z=-800、pe=800、看向 z=0 平面：缩放 0.5，投影中心仍是 (200,200)
+    let mut layer = base_layer(serde_json::json!([rect_group(
+      serde_json::json!({"ty": "fl", "c": {"a": 0, "k": [1, 0, 0, 1]}, "o": {"a": 0, "k": 100}})
+    )]));
+    layer["ddd"] = serde_json::json!(1);
+    let camera = serde_json::json!({
+      "ty": 13, "nm": "Camera", "pe": 800, "ip": 0, "op": 60, "st": 0,
+      "ks": {
+        "p": {"a": 0, "k": [200, 200, -800]},
+        "a": {"a": 0, "k": [200, 200, 0]},
+        "o": {"a": 0, "k": 100}
+      }
+    });
+    let doc = serde_json::json!({
+      "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+      "layers": [layer, camera]
+    });
+    let words = read_words(&render_frame(&compile_doc(&doc, 400.0, 400.0).expect("compile"), 0.0));
+    let base = vertex_base(&words);
+    let count = words[1] as usize;
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
+    for i in 0..count {
+      let v = read_vertex(&words, base, i);
+      min_x = min_x.min(v[0]);
+      max_x = max_x.max(v[0]);
+    }
+    // 矩形宽 200，缩放 0.5 后宽 100，且以 200 为中心
+    let width = max_x - min_x;
+    assert!((width - 100.0).abs() < 2.0, "相机投影宽度 {width}");
+    assert!(((min_x + max_x) / 2.0 - 200.0).abs() < 2.0, "投影中心 {}", (min_x + max_x) / 2.0);
+  }
+
+  #[test]
+  fn precomp_camera_is_rejected() {
+    // 预合成内的相机需要独立视图，必须显式拒绝而不是静默忽略
+    let sub = serde_json::json!([{
+      "ty": 13, "nm": "Camera", "pe": 800, "ip": 0, "op": 60,
+      "ks": {"p": {"a": 0, "k": [200, 200, -800]}, "a": {"a": 0, "k": [200, 200, 0]}}
+    }]);
+    let doc = serde_json::json!({
+      "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+      "assets": [{"id": "comp1", "layers": sub}],
+      "layers": [{
+        "ddd": 0, "ind": 1, "ty": 0, "refId": "comp1", "nm": "pre", "sr": 1,
+        "ks": {"o": {"a": 0, "k": 100}, "r": {"a": 0, "k": 0},
+               "p": {"a": 0, "k": [200, 200, 0]}, "a": {"a": 0, "k": [0, 0, 0]},
+               "s": {"a": 0, "k": [100, 100, 100]}},
+        "ip": 0, "op": 60, "st": 0, "bm": 0
+      }]
+    });
+    let err = match compile_doc(&doc, 400.0, 400.0) {
+      Err(message) => message,
+      Ok(_) => panic!("预合成内的相机应当编译失败"),
+    };
+    assert!(err.contains("预合成内的 3D 相机"), "实际错误：{err}");
+  }
+
+  #[test]
   fn unsupported_features_fail_explicitly() {
     let mut doc = serde_json::json!({
       "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
@@ -3557,6 +3877,54 @@ mod tests {
       }
     }
     area
+  }
+
+  #[test]
+  fn stacked_gaussian_blurs_merge_sigma() {
+    // 两个模糊（Blurriness 20 与 10）叠加：σ = √(6² + 3²) = 6.708
+    let mut layer = base_layer(serde_json::json!([rect_group(
+      serde_json::json!({"ty": "fl", "c": {"a": 0, "k": [1, 0, 0, 1]}, "o": {"a": 0, "k": 100}})
+    )]));
+    layer["ef"] = serde_json::json!([
+      {
+        "ty": 29, "en": 1, "nm": "Gaussian Blur",
+        "ef": [
+          {"v": {"a": 0, "k": 20}},
+          {"v": {"a": 0, "k": 1}},
+          {"v": {"a": 0, "k": 0}}
+        ]
+      },
+      {
+        "ty": 29, "en": 1, "nm": "Gaussian Blur 2",
+        "ef": [
+          {"v": {"a": 0, "k": 10}},
+          {"v": {"a": 0, "k": 1}},
+          {"v": {"a": 0, "k": 1}}
+        ]
+      }
+    ]);
+    let doc = serde_json::json!({
+      "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+      "layers": [layer]
+    });
+    let words = read_words(&render_frame(&compile_doc(&doc, 400.0, 400.0).expect("compile"), 0.0));
+    let tail = tail_start(&words);
+    assert_eq!(words[tail], 1, "叠加模糊仍只登记一个离屏 pass");
+    let p = tail + 1;
+    let sigma_x = f32::from_bits(words[p + 4]);
+    assert!((sigma_x - 6.7082).abs() < 0.02, "合并 sigma {sigma_x}");
+    // Edge Mode 取最后一个模糊：wrap = 1
+    assert_eq!(words[p + 3], 1, "最后一个模糊是 repeat edge");
+    // 非高斯特效仍然显式拒绝
+    layer["ef"] = serde_json::json!([
+      {"ty": 29, "en": 1, "ef": [{"v": {"a": 0, "k": 20}}, {"v": {"a": 0, "k": 1}}, {"v": {"a": 0, "k": 0}}]},
+      {"ty": 21, "en": 1, "ef": [{"v": {"a": 0, "k": 5}}, {"v": {"a": 0, "k": 1}}, {"v": {"a": 0, "k": 0}}]}
+    ]);
+    let doc = serde_json::json!({
+      "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+      "layers": [layer]
+    });
+    assert!(compile_doc(&doc, 400.0, 400.0).is_err(), "非高斯特效应报错");
   }
 
   #[test]
