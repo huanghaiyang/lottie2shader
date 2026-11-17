@@ -15,15 +15,16 @@
 //! - 矩形 rc、椭圆 el、贝塞尔路径 sh、组 gr；
 //! - 纯色填充 fl、纯色描边 st、线性/径向渐变填充 gf、渐变描边 gs；
 //! - trim path（tm，支持按组合长度或按单条路径裁剪，支持动画）；
-//! - 合并路径（mm，仅 Merge 模式：把组内子路径合并后用组的填充规则整体三角化）；
+//! - 合并路径（mm：1 Merge / 2 Add / 5 Exclude，Exclude 用绕向反转精确实现异或）；
+//! - 图层蒙版（masksProperties，a/s/i/n 四种模式）与扩张/收缩（x，按轮廓法线偏移实现）；
 //! - 轨道遮罩（tt=1/2，alpha 与反相 alpha）；亮度遮罩不支持；
 //! - 3D 图层的 rx/ry/rz 旋转与透视投影（不含 3D 相机）；
 //! - 图层与组的变换、不透明度关键帧、父子关系、预合成嵌套。
 //!
 //! 明确不支持的特性会直接返回错误，由前端注册中心回退到 canvas，绝不静默画错：
-//! 文本图层（需要字体轮廓）、表达式（需要 JS 引擎）、图层蒙版、图层特效、
-//! 3D 相机、亮度轨道遮罩、星形/重复器等形状修饰器，以及合并路径的布尔模式
-//! （mm=2/3/4/5，Add/Subtract/Intersect/Exclude）。
+//! 文本图层（需要字体轮廓）、表达式（需要 JS 引擎）、图层特效（多特效叠加）、
+//! 3D 相机、亮度轨道遮罩、星形/重复器等形状修饰器，以及合并路径的
+//! Intersect（mm=4，需要真正的多边形裁剪）。
 
 use std::collections::{HashMap, HashSet};
 
@@ -541,6 +542,8 @@ struct MaskSpec {
   inv: bool,
   /// 不透明度（百分比属性）
   opacity: Value,
+  /// 扩张/收缩（masksProperties[].x）：正值外扩、负值收缩，单位为合成像素
+  expand: Value,
 }
 
 struct ImageAsset {
@@ -608,6 +611,159 @@ fn bezier_path(
   Some(builder.build())
 }
 
+/// 蒙版扩张/收缩：把轮廓按像素距离做整体法线偏移（等价于 feMorphology 的膨胀/腐蚀）。
+///
+/// 做法：先在图层局部坐标里把贝塞尔轮廓离散成折线，再沿顶点法线整体平移 distance，
+/// 最后用世界+画布矩阵映射回屏幕坐标交给三角化。lottie 的 `masksProperties[].x`
+/// 单位就是合成像素，所以偏移必须在应用图层缩放之前完成。
+fn expand_mask_path(
+  verts: &[[f32; 2]],
+  ins: &[[f32; 2]],
+  outs: &[[f32; 2]],
+  closed: bool,
+  mat: &Mat,
+  expand: f32,
+) -> Option<Path> {
+  let local = bezier_path(verts, ins, outs, closed, &Mat::identity())?;
+  let points = flatten_path_points(&local, CURVE_FLATTEN_STEPS);
+  if points.len() < 3 {
+    return None;
+  }
+  let source_area = polygon_area(&points).abs();
+  // 顶点绕向决定法线朝内还是朝外：面积为正说明法线指向轮廓内侧，要取反才是「扩张」
+  let outward = if polygon_area(&points) > 0.0 { -1.0 } else { 1.0 };
+  let moved = offset_polygon(&points, expand * outward);
+  debug_assert!((polygon_area(&moved).abs() > source_area) == (expand > 0.0));
+  if moved.len() < 3 {
+    return None;
+  }
+  let mut builder = Path::builder();
+  builder.begin(to_point(mat, moved[0]));
+  for point in &moved[1..] {
+    builder.line_to(to_point(mat, *point));
+  }
+  builder.end(closed);
+  Some(builder.build())
+}
+
+/// 每条贝塞尔曲线段的离散步数：24 段对 800px 画布已经远小于一个像素的误差。
+const CURVE_FLATTEN_STEPS: usize = 24;
+
+/// 把路径离散成折线点；闭合路径不重复首点，便于按顶点环做偏移。
+fn flatten_path_points(path: &Path, steps: usize) -> Vec<[f32; 2]> {
+  let mut out: Vec<[f32; 2]> = Vec::new();
+  let steps = steps.max(2);
+  for event in path.iter() {
+    match event {
+      PathEvent::Begin { at } => {
+        out.clear();
+        out.push([at.x, at.y]);
+      }
+      PathEvent::Line { to, .. } => push_unique_point(&mut out, [to.x, to.y]),
+      PathEvent::Quadratic { from, ctrl, to } => {
+        for k in 1..=steps {
+          let t = k as f32 / steps as f32;
+          let mt = 1.0 - t;
+          let point = [
+            mt * mt * from.x + 2.0 * mt * t * ctrl.x + t * t * to.x,
+            mt * mt * from.y + 2.0 * mt * t * ctrl.y + t * t * to.y,
+          ];
+          push_unique_point(&mut out, point);
+        }
+      }
+      PathEvent::Cubic { from, ctrl1, ctrl2, to } => {
+        for k in 1..=steps {
+          let t = k as f32 / steps as f32;
+          let mt = 1.0 - t;
+          let a = mt * mt * mt;
+          let b = 3.0 * mt * mt * t;
+          let c = 3.0 * mt * t * t;
+          let d = t * t * t;
+          let point = [
+            a * from.x + b * ctrl1.x + c * ctrl2.x + d * to.x,
+            a * from.y + b * ctrl1.y + c * ctrl2.y + d * to.y,
+          ];
+          push_unique_point(&mut out, point);
+        }
+      }
+      PathEvent::End { close, .. } => {
+        // 闭合轮廓的最后一条线段会回到首点，去掉这个重复点才能按顶点环做偏移
+        if close && out.len() > 1 {
+          let first = out[0];
+          let last = out[out.len() - 1];
+          if (first[0] - last[0]).abs() < 1.0e-4 && (first[1] - last[1]).abs() < 1.0e-4 {
+            out.pop();
+          }
+        }
+        break;
+      }
+    }
+  }
+  out
+}
+
+/// 追加点，并丢掉与上一个点几乎重合的采样点（曲线端点会与下一段起点重复）
+fn push_unique_point(points: &mut Vec<[f32; 2]>, point: [f32; 2]) {
+  if let Some(last) = points.last() {
+    let dx = last[0] - point[0];
+    let dy = last[1] - point[1];
+    if dx * dx + dy * dy < 1.0e-8 {
+      return;
+    }
+  }
+  points.push(point);
+}
+
+/// 多边形有符号面积（鞋带公式），符号即顶点绕向
+fn polygon_area(points: &[[f32; 2]]) -> f32 {
+  let n = points.len();
+  if n < 3 {
+    return 0.0;
+  }
+  let mut sum = 0.0;
+  for i in 0..n {
+    let a = points[i];
+    let b = points[(i + 1) % n];
+    sum += a[0] * b[1] - b[0] * a[1];
+  }
+  sum * 0.5
+}
+
+/// 沿顶点法线整体偏移多边形：相邻两条边的法线取平均，斜接长度按夹角修正
+fn offset_polygon(points: &[[f32; 2]], distance: f32) -> Vec<[f32; 2]> {
+  let n = points.len();
+  if n < 3 || distance.abs() < 1.0e-5 {
+    return points.to_vec();
+  }
+  let mut out = Vec::with_capacity(n);
+  for i in 0..n {
+    let prev = points[(i + n - 1) % n];
+    let cur = points[i];
+    let next = points[(i + 1) % n];
+    let e1 = unit_vector([cur[0] - prev[0], cur[1] - prev[1]]);
+    let e2 = unit_vector([next[0] - cur[0], next[1] - cur[1]]);
+    let n1 = [-e1[1], e1[0]];
+    let n2 = [-e2[1], e2[0]];
+    let sum = [n1[0] + n2[0], n1[1] + n2[1]];
+    let len = (sum[0] * sum[0] + sum[1] * sum[1]).sqrt();
+    let normal = if len < 1.0e-5 { n1 } else { [sum[0] / len, sum[1] / len] };
+    // 夹角越尖，斜接长度越长；下限 0.35 防止锐角尖刺飞出去
+    let miter = distance / (normal[0] * n1[0] + normal[1] * n1[1]).clamp(0.35, 1.0);
+    out.push([cur[0] + normal[0] * miter, cur[1] + normal[1] * miter]);
+  }
+  out
+}
+
+/// 单位化二维向量，零长度时返回零向量
+fn unit_vector(v: [f32; 2]) -> [f32; 2] {
+  let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
+  if len < 1.0e-6 {
+    [0.0, 0.0]
+  } else {
+    [v[0] / len, v[1] / len]
+  }
+}
+
 /// mm=1（Merge）：把组内子路径合并成一条路径。
 /// Merge 不做布尔运算，只把各子轮廓归入同一条路径，由后续填充规则（nonzero/evenodd）
 /// 统一判定内部区域，因此空洞、重叠等由轮廓绕向自然表达。
@@ -640,6 +796,33 @@ fn merge_paths(paths: &mut Vec<Path>) {
   let merged = builder.build();
   paths.clear();
   paths.push(merged);
+}
+
+/// mm=3（Subtract）/ mm=5（Exclude）：反转第一个子路径之外的所有轮廓绕向。
+/// 在 nonzero 填充下，重叠区域的正负绕向相互抵消，效果等价于「减去」与「异或」；
+/// 这是纯几何近似，省掉了多边形布尔裁剪（Intersect 仍需真正的裁剪，故不支持）。
+fn reverse_tail_windings(paths: &mut Vec<Path>) {
+  for path in paths.iter_mut().skip(1) {
+    if let Some(reversed) = reversed_path(path) {
+      *path = reversed;
+    }
+  }
+}
+
+/// 反转单条闭合轮廓的绕向（曲线离散成折线后倒序重建）
+fn reversed_path(path: &Path) -> Option<Path> {
+  let mut points = flatten_path_points(path, CURVE_FLATTEN_STEPS);
+  if points.len() < 3 {
+    return None;
+  }
+  points.reverse();
+  let mut builder = Path::builder();
+  builder.begin(Point::new(points[0][0], points[0][1]));
+  for point in &points[1..] {
+    builder.line_to(Point::new(point[0], point[1]));
+  }
+  builder.end(true);
+  Some(builder.build())
 }
 
 fn arr2(v: Option<&Value>) -> Vec<[f32; 2]> {
@@ -1561,7 +1744,11 @@ fn walk_items(
         }
       }
       "mm" => {
-        // 合并模式在 check_shapes 已校验，这里只处理 mm=1（Merge）
+        // 合并模式在 check_shapes 已校验：1/2 直接合并，5 Exclude 先反转后续轮廓绕向
+        let mode = as_f32(item.get("mm"), 1.0) as i32;
+        if mode == 5 {
+          reverse_tail_windings(&mut paths);
+        }
         merge_paths(&mut paths);
       }
       "fl" => {
@@ -1650,9 +1837,14 @@ fn check_shapes(items: &[Value]) -> Result<(), String> {
         }
       }
       "mm" => {
-        // 仅实现 Merge（mm=1）；Add/Subtract/Intersect/Exclude 需要布尔运算
-        if as_f32(item.get("mm"), 1.0) >= 1.5 {
-          return Err("不支持的合并路径模式（仅支持 Merge，请回退 canvas 渲染）".to_string());
+        // 1 Merge / 2 Add：直接合并；5 Exclude：反转后续轮廓绕向（异或精确）；
+        // 3 Subtract / 4 Intersect 需要真正的多边形裁剪，仍交回 canvas
+        let mode = as_f32(item.get("mm"), 1.0) as i32;
+        if mode == 3 || mode == 4 {
+          return Err(format!(
+            "不支持的合并路径模式 {}（需要布尔裁剪，请回退 canvas 渲染）",
+            if mode == 3 { "Subtract" } else { "Intersect" }
+          ));
         }
       }
       "rd" => {
@@ -1732,6 +1924,7 @@ fn layer_masks(layer: &Value) -> Vec<MaskSpec> {
         mode,
         inv: as_f32(mask.get("inv"), 0.0) > 0.5,
         opacity: mask.get("o").cloned().unwrap_or(Value::Null),
+        expand: mask.get("x").cloned().unwrap_or(Value::Null),
       })
     })
     .collect()
@@ -1776,9 +1969,9 @@ fn check_layers(
         if !matches!(mode, "a" | "s" | "i" | "n") {
           return Err(format!("不支持的图层蒙版模式：{mode}（请回退 canvas 渲染）"));
         }
-        // lottie 用 feMorphology 实现蒙版扩张/收缩，GPU 侧没有等价实现
-        if prop_f32(mask.get("x"), 0.0, 0.0).abs() > 1.0e-6 {
-          return Err("图层蒙版的扩张/收缩（x）暂不支持（请回退 canvas 渲染）".to_string());
+        // 扩张/收缩已由 Rust 侧按轮廓法线偏移实现，只有表达式形式仍需 JS 引擎求值
+        if mask.get("x").map(|x| x.is_string()).unwrap_or(false) {
+          return Err("图层蒙版的扩张/收缩使用了表达式（需要 JS 引擎）".to_string());
         }
         if mask.get("pt").is_none() {
           return Err("图层蒙版缺少路径属性 pt".to_string());
@@ -2355,7 +2548,14 @@ impl<'a> Renderer<'a> {
       if opacity <= 0.001 {
         continue;
       }
-      let Some(path) = bezier_path(&data.verts, &data.ins, &data.outs, data.closed, &cmat) else {
+      // 扩张/收缩非零时走法线偏移路径，否则直接用贝塞尔原路径
+      let expand = prop_f32(Some(&mask.expand), local, 0.0);
+      let path = if expand.abs() > 1.0e-4 {
+        expand_mask_path(&data.verts, &data.ins, &data.outs, data.closed, &cmat, expand)
+      } else {
+        bezier_path(&data.verts, &data.ins, &data.outs, data.closed, &cmat)
+      };
+      let Some(path) = path else {
         continue;
       };
       let mut geoms: Vec<Geom> = Vec::new();
@@ -3392,6 +3592,103 @@ mod tests {
     // 内容批次应归属该 pass，JS 才会走离屏渲染
     let batch_pass = words[3 + 58] as usize;
     assert_eq!(batch_pass, words[p] as usize, "批次应带上 passId");
+  }
+
+  #[test]
+  fn mask_expand_offsets_coverage_outline() {
+    // 100×80 的矩形：扩张 20 后宽度应变成 140，收缩 20 后应变成 60
+    let verts: Vec<[f32; 2]> = vec![[-50.0, -40.0], [50.0, -40.0], [50.0, 40.0], [-50.0, 40.0]];
+    let zeros: Vec<[f32; 2]> = vec![[0.0, 0.0]; 4];
+    let width_of = |source: &[[f32; 2]], expand: f32| {
+      let path = expand_mask_path(source, &zeros, &zeros, true, &Mat::identity(), expand)
+        .expect("扩张/收缩应生成路径");
+      let points = flatten_path_points(&path, 2);
+      let min_x = points.iter().fold(f32::INFINITY, |m, p| m.min(p[0]));
+      let max_x = points.iter().fold(f32::NEG_INFINITY, |m, p| m.max(p[0]));
+      max_x - min_x
+    };
+    let grow = width_of(&verts, 20.0);
+    let shrink = width_of(&verts, -20.0);
+    assert!((grow - 140.0).abs() < 1.0, "扩张后宽度 {grow}");
+    assert!((shrink - 60.0).abs() < 1.0, "收缩后宽度 {shrink}");
+    // 顶点绕向相反时，面积自校正要保证仍然向外扩张而不是向内收缩
+    let flipped: Vec<[f32; 2]> = verts.iter().rev().copied().collect();
+    let flipped_grow = width_of(&flipped, 20.0);
+    assert!((flipped_grow - 140.0).abs() < 1.0, "反向绕向扩张后宽度 {flipped_grow}");
+  }
+
+  #[test]
+  fn mask_expand_widens_coverage_in_render_plan() {
+    // 端到端：masksProperties[].x 从 JSON 一路传到覆盖几何的包围盒
+    let make = |x: f32| {
+      let mut layer = base_layer(serde_json::json!([rect_group(
+        serde_json::json!({"ty": "fl", "c": {"a": 0, "k": [0, 1, 0, 1]}, "o": {"a": 0, "k": 100}})
+      )]));
+      layer["masksProperties"] = serde_json::json!([{
+        "mode": "a", "inv": false, "nm": "m",
+        "x": {"a": 0, "k": x},
+        "pt": {"a": 0, "k": {
+          "c": true,
+          "v": [[-110, -80], [110, -80], [110, 80], [-110, 80]],
+          "i": [[0, 0], [0, 0], [0, 0], [0, 0]],
+          "o": [[0, 0], [0, 0], [0, 0], [0, 0]]
+        }},
+        "o": {"a": 0, "k": 100}
+      }]);
+      serde_json::json!({
+        "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 800, "h": 600,
+        "layers": [layer]
+      })
+    };
+    let coverage_width = |x: f32| {
+      let words = read_words(&render_frame(&compile_doc(&make(x), 800.0, 600.0).unwrap(), 0.0));
+      let verts_at = 3 + words[0] as usize * BATCH_WORDS;
+      let mut min_x = f32::INFINITY;
+      let mut max_x = f32::NEG_INFINITY;
+      for b in 0..words[0] as usize {
+        if words[3 + b * BATCH_WORDS] != KIND_MASK {
+          continue;
+        }
+        let first = words[3 + b * BATCH_WORDS + 1] as usize;
+        let count = words[3 + b * BATCH_WORDS + 2] as usize;
+        for v in first..first + count {
+          let x = f32::from_bits(words[verts_at + v * 2]);
+          min_x = min_x.min(x);
+          max_x = max_x.max(x);
+        }
+      }
+      max_x - min_x
+    };
+    let plain = coverage_width(0.0);
+    let grown = coverage_width(40.0);
+    assert!((plain - 220.0).abs() < 2.0, "原始覆盖宽度 {plain}");
+    assert!((grown - 300.0).abs() < 3.0, "扩张后覆盖宽度 {grown}");
+  }
+
+  #[test]
+  fn merge_paths_exclude_and_subtract_follow_winding() {
+    // 两个 100×100 矩形，第二个偏移 (30,30)：并集 15100、重叠 70×70=4900
+    let make = |mode: f32| {
+      serde_json::json!({
+        "v": "5.7.4", "fr": 30, "ip": 0, "op": 60, "w": 400, "h": 400,
+        "layers": [base_layer(serde_json::json!([{
+          "ty": "gr", "nm": "g", "np": 4,
+          "it": [
+            {"ty": "rc", "d": 1, "s": {"a": 0, "k": [100, 100]}, "p": {"a": 0, "k": [0, 0]}, "r": {"a": 0, "k": 0}},
+            {"ty": "rc", "d": 1, "s": {"a": 0, "k": [100, 100]}, "p": {"a": 0, "k": [30, 30]}, "r": {"a": 0, "k": 0}},
+            {"ty": "mm", "mm": mode},
+            {"ty": "fl", "c": {"a": 0, "k": [1, 0, 0, 1]}, "o": {"a": 0, "k": 100}, "r": 1}
+          ]
+        }]))]
+      })
+    };
+    let merge = total_area(&read_words(&render_frame(&compile_doc(&make(1.0), 400.0, 400.0).unwrap(), 0.0)));
+    assert!((merge - 15100.0).abs() < 60.0, "Merge 面积 {merge}");
+    // Exclude：并集减去两倍重叠（绕向近似对任意重叠都是精确的）
+    let exclude = total_area(&read_words(&render_frame(&compile_doc(&make(5.0), 400.0, 400.0).unwrap(), 0.0)));
+    assert!((exclude - 10200.0).abs() < 60.0, "Exclude 面积 {exclude}");
+    // Subtract 需要真正的裁剪（第二个矩形有部分落在外面），必须显式报错而不是画错
+    assert!(compile_doc(&make(3.0), 400.0, 400.0).is_err(), "mm=3 应显式报错");
   }
 
   #[test]
